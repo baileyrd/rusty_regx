@@ -77,6 +77,9 @@ Other decisions:
    `regex` crate (dev-dependency only) and a bash oracle script; port rush's
    C56 tests. Gate the swap on this.
 6. **(v2) POSIX leftmost-longest mode** — closes the known `a|ab` divergence
-   between rush and real bash.
+   between rush and real bash. *(Done: `Regex::new_posix`. Implemented as a
+   second VM execution mode that replaces priority-based disambiguation with
+   capture-vector comparison over hidden repetition span tags, compared in
+   syntactic pre-order. Polynomial worst case, never exponential.)*
 
 Estimated size: ~1.5–2.5k lines of engine + a comparable test volume.

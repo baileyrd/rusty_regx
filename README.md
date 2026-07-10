@@ -47,9 +47,21 @@ if let Some(caps) = re.captures("release-2026") {
 }
 ```
 
-Matching is an unanchored search (like bash `=~`) with leftmost-first
-semantics in v1, identical to the `regex` crate. POSIX leftmost-longest is a
-planned v2 opt-in mode.
+Matching is an unanchored search (like bash `=~`). `Regex::new` uses
+leftmost-first semantics, identical to the `regex` crate. `Regex::new_posix`
+opts into POSIX leftmost-longest semantics — what real bash/glibc report:
+
+```rust
+use rusty_regx::Regex;
+
+assert_eq!(Regex::new("a|ab")?.captures("ab").unwrap().get(0), Some("a"));
+assert_eq!(Regex::new_posix("a|ab")?.captures("ab").unwrap().get(0), Some("ab"));
+```
+
+The POSIX mode's overall match (group 0) agrees with bash exactly across the
+differential harness; submatch reporting follows the POSIX
+longest-alternative rule, which glibc itself deviates from in rare corners
+(~0.01% of randomly generated cases).
 
 See [DESIGN.md](DESIGN.md) for the architecture and full roadmap.
 

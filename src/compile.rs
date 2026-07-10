@@ -45,6 +45,13 @@ pub struct Program {
     pub insts: Vec<Inst>,
     /// Number of capture groups including group 0.
     pub group_count: usize,
+    /// Total `Save` slots: two per group, plus two per repetition (hidden
+    /// span tags used only by POSIX-mode disambiguation).
+    pub slot_count: usize,
+    /// Slot-pair base indices in syntactic pre-order (group 0 first, then
+    /// groups and repetition spans outer-first, left-to-right) — the
+    /// comparison order for POSIX leftmost-longest disambiguation.
+    pub tag_order: Vec<usize>,
 }
 
 /// Compiles an AST into a [`Program`].
@@ -53,6 +60,11 @@ pub struct Program {
 /// execution is an unanchored search, matching bash `=~` semantics.
 pub fn compile(ast: &Ast) -> Result<Program, Error> {
     let group_count = max_group(ast) as usize + 1;
+    let mut ast = ast.clone();
+    let mut tag_order = vec![0];
+    let mut next_slot = 2 * group_count;
+    number(&mut ast, &mut next_slot, &mut tag_order);
+
     let mut c = Compiler { insts: Vec::new() };
     // Unanchored-search prefix, non-greedy: prefer starting the match at the
     // current position (leftmost) over consuming another character.
@@ -63,13 +75,46 @@ pub fn compile(ast: &Ast) -> Result<Program, Error> {
     c.push(Inst::AnyChar)?;
     c.push(Inst::Jump(0))?;
     c.push(Inst::Save(0))?;
-    c.emit(ast)?;
+    c.emit(&ast)?;
     c.push(Inst::Save(1))?;
     c.push(Inst::Match)?;
     Ok(Program {
         insts: c.insts,
         group_count,
+        slot_count: next_slot,
+        tag_order,
     })
+}
+
+/// Assigns span-tag slots to repetitions and records the disambiguation
+/// order: syntactic pre-order, so an outer construct's pair is compared
+/// before anything inside it, and siblings compare left-to-right. This is
+/// what makes POSIX mode prefer a longer repetition span over a "better"
+/// last iteration inside a shorter one.
+fn number(ast: &mut Ast, next_slot: &mut usize, tag_order: &mut Vec<usize>) {
+    match ast {
+        Ast::Empty
+        | Ast::Char(_)
+        | Ast::AnyChar
+        | Ast::Class(_)
+        | Ast::StartAnchor
+        | Ast::EndAnchor => {}
+        Ast::Concat(items) | Ast::Alternation(items) => {
+            for item in items {
+                number(item, next_slot, tag_order);
+            }
+        }
+        Ast::Group(index, inner) => {
+            tag_order.push(2 * *index as usize);
+            number(inner, next_slot, tag_order);
+        }
+        Ast::Repeat { ast, slot, .. } => {
+            *slot = *next_slot;
+            *next_slot += 2;
+            tag_order.push(*slot);
+            number(ast, next_slot, tag_order);
+        }
+    }
 }
 
 /// The highest group index appearing in the AST (0 if none).
@@ -137,7 +182,12 @@ impl Compiler {
                 self.emit(inner)?;
                 self.push(Inst::Save(slot + 1))?;
             }
-            Ast::Repeat { ast, min, max } => self.repeat(ast, *min, *max)?,
+            Ast::Repeat {
+                ast,
+                min,
+                max,
+                slot,
+            } => self.repeat(ast, *min, *max, *slot)?,
         }
         Ok(())
     }
@@ -186,10 +236,12 @@ impl Compiler {
     /// (`(a?)*` on "b" reports group 1 = "", not absent) yet kill it when a
     /// consuming iteration already happened (`(a?)*` on "aab" reports "a",
     /// not "") — which is exactly what sharing the body tail achieves.
-    fn repeat(&mut self, ast: &Ast, min: u32, max: Option<u32>) -> Result<(), Error> {
+    fn repeat(&mut self, ast: &Ast, min: u32, max: Option<u32>, slot: usize) -> Result<(), Error> {
         if min > MAX_REPETITION_SIZE || max.is_some_and(|m| m > MAX_REPETITION_SIZE) {
             return Err(Error::RepetitionTooLarge);
         }
+        // Hidden span tags around the whole construct (see `number`).
+        self.push(Inst::Save(slot))?;
         match max {
             None => {
                 for _ in 1..min {
@@ -249,6 +301,7 @@ impl Compiler {
                 }
             }
         }
+        self.push(Inst::Save(slot + 1))?;
         Ok(())
     }
 }
