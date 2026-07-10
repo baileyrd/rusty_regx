@@ -1,0 +1,17 @@
+[package]
+name = "rusty_regx"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "A minimal, linear-time POSIX-ERE regex engine with no dependencies"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/baileyrd/rusty_regx"
+keywords = ["regex", "posix", "ere"]
+categories = ["text-processing"]
+
+[dependencies]
+# Intentionally empty: zero runtime dependencies is a core goal.
+
+[dev-dependencies]
+# The `regex` crate will be added here (dev-only) for the differential
+# test harness in roadmap step 5.
