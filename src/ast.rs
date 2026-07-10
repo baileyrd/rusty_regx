@@ -1,8 +1,5 @@
 //! The abstract syntax tree produced by the ERE parser.
 
-// TODO: remove once the parser (roadmap step 1) constructs these.
-#![allow(dead_code)]
-
 /// A parsed pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ast {

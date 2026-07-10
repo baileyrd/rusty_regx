@@ -19,6 +19,19 @@
 //! - v1 uses leftmost-first (Perl-style) match semantics, identical to the
 //!   `regex` crate. POSIX leftmost-longest is planned as a v2 opt-in mode.
 //!
+//! # Example
+//!
+//! ```
+//! use rusty_regx::Regex;
+//!
+//! let re = Regex::new("^([[:alpha:]]+)-([0-9]{2,4})$")?;
+//! let caps = re.captures("release-2026").unwrap();
+//! assert_eq!(caps.get(0), Some("release-2026"));
+//! assert_eq!(caps.get(1), Some("release"));
+//! assert_eq!(caps.get(2), Some("2026"));
+//! # Ok::<(), rusty_regx::Error>(())
+//! ```
+//!
 //! See `DESIGN.md` in the repository for the full design and roadmap.
 
 #![forbid(unsafe_code)]
