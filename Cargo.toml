@@ -13,5 +13,6 @@ categories = ["text-processing"]
 # Intentionally empty: zero runtime dependencies is a core goal.
 
 [dev-dependencies]
-# The `regex` crate will be added here (dev-only) for the differential
-# test harness in roadmap step 5.
+# Dev-only: the reference implementation for the differential harness
+# (tests/differential.rs). Never a runtime dependency.
+regex = "1"
