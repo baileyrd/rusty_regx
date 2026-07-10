@@ -174,35 +174,58 @@ impl Compiler {
         Ok(())
     }
 
-    /// Quantifiers compile by repetition: `min` mandatory copies, then
-    /// either a greedy star (unbounded) or `max - min` greedy optional
-    /// copies.
+    /// Quantifiers compile by repetition: for `{m,}`, `m` copies with the
+    /// last one looping (zero copies plus a standalone loop for `m = 0`);
+    /// for `{m,n}`, `m` mandatory copies then `n - m` greedy optionals.
+    ///
+    /// Loop-backs target the *shared* body of the final copy, and the
+    /// loop-back is a Split rather than a Jump to the entry Split. Both are
+    /// load-bearing for capture agreement with the regex crate on bodies
+    /// that can match empty: the epsilon-closure visited set must let a
+    /// final empty iteration record its captures when nothing was consumed
+    /// (`(a?)*` on "b" reports group 1 = "", not absent) yet kill it when a
+    /// consuming iteration already happened (`(a?)*` on "aab" reports "a",
+    /// not "") — which is exactly what sharing the body tail achieves.
     fn repeat(&mut self, ast: &Ast, min: u32, max: Option<u32>) -> Result<(), Error> {
         if min > MAX_REPETITION_SIZE || max.is_some_and(|m| m > MAX_REPETITION_SIZE) {
             return Err(Error::RepetitionTooLarge);
         }
-        for _ in 0..min {
-            self.emit(ast)?;
-        }
         match max {
             None => {
-                // Greedy star: prefer another iteration over falling through.
-                let split = self.push(Inst::Split {
-                    first: 0,
-                    second: 0,
-                })?;
-                self.insts[split] = Inst::Split {
-                    first: split + 1,
-                    second: 0, // patched below
+                for _ in 1..min {
+                    self.emit(ast)?;
+                }
+                let enter = if min == 0 {
+                    // Star: entering the loop at all is optional.
+                    let enter = self.push(Inst::Split {
+                        first: 0,
+                        second: 0,
+                    })?;
+                    self.insts[enter] = Inst::Split {
+                        first: enter + 1,
+                        second: 0, // patched below
+                    };
+                    Some(enter)
+                } else {
+                    None
                 };
+                let body = self.next();
                 self.emit(ast)?;
-                self.push(Inst::Jump(split))?;
+                let exit = self.push(Inst::Split {
+                    first: body,
+                    second: 0, // patched below
+                })?;
                 let after = self.next();
-                if let Inst::Split { second, .. } = &mut self.insts[split] {
-                    *second = after;
+                for split in enter.into_iter().chain([exit]) {
+                    if let Inst::Split { second, .. } = &mut self.insts[split] {
+                        *second = after;
+                    }
                 }
             }
             Some(max) => {
+                for _ in 0..min {
+                    self.emit(ast)?;
+                }
                 // Greedy optionals: each split prefers its copy; on the
                 // first skip, jump past the whole chain.
                 let mut splits = Vec::new();
