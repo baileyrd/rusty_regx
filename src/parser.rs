@@ -98,6 +98,7 @@ impl Parser {
                         ast: Box::new(ast),
                         min,
                         max,
+                        slot: 0,
                     });
                 }
                 Some(_) => items.push(self.atom()?),
@@ -118,6 +119,7 @@ impl Parser {
             ast: Box::new(ast),
             min,
             max,
+            slot: 0,
         });
         Ok(())
     }
@@ -291,6 +293,7 @@ mod tests {
             ast: Box::new(ast),
             min,
             max,
+            slot: 0,
         }
     }
 

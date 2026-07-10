@@ -175,12 +175,53 @@ fn differential_against_regex_crate() {
                     .map(|i| caps.get(i).map(|m| m.as_str().to_owned()))
                     .collect()
             });
+            if a != b && crate_skipped_earlier_match(&pattern, &ours, &theirs, &text) {
+                continue;
+            }
             assert_eq!(
                 a, b,
                 "case {case}: divergence on pattern {pattern:?}, text {text:?} (ours = left)"
             );
         }
     }
+}
+
+/// The regex crate's literal optimizations can return a *later-starting*
+/// match than its own leftmost contract promises (e.g. `a|[0-9].*aa` on
+/// `"-bc0b0aa"` yields `"a"` at offset 6, though a match starts at 3 —
+/// Perl and bash both return `"0b0aa"`). `find_at` shows the same
+/// artifact, so when we disagree we accept our answer iff it starts
+/// strictly earlier AND an *anchored* recompile of the same pattern
+/// (which bypasses the prefilter) confirms our exact match at that offset
+/// — proof the artifact is theirs, not ours.
+fn crate_skipped_earlier_match(
+    pattern: &str,
+    ours: &Regex,
+    theirs: &regex::Regex,
+    text: &str,
+) -> bool {
+    let (our_g0, their_m) = match (
+        ours.captures(text).and_then(|c| c.get(0)),
+        theirs.find(text),
+    ) {
+        (Some(g0), Some(m)) => (g0, m),
+        _ => return false,
+    };
+    // Our group 0 is a subslice of `text`; recover its byte offset.
+    let our_start = our_g0.as_ptr() as usize - text.as_ptr() as usize;
+    if our_start >= their_m.start() {
+        return false;
+    }
+    // Anchors keep their meaning relative to the full text, so anchored
+    // patterns can't be confirmed this way (the generator only ever places
+    // anchors at the pattern's ends; a leading `[^…]` class is not one).
+    if pattern.starts_with('^') || pattern.ends_with('$') {
+        return false;
+    }
+    regex::Regex::new(&format!("^(?:{pattern})"))
+        .ok()
+        .and_then(|re| re.find(&text[our_start..]))
+        .is_some_and(|m| m.as_str() == our_g0)
 }
 
 #[test]
@@ -244,4 +285,102 @@ fn differential_against_bash_oracle() {
             "bash divergence on pattern {pattern:?}, text {text:?} (ours = left)"
         );
     }
+}
+
+/// POSIX mode vs. bash, comparing the full BASH_REMATCH contents — group
+/// bounds and submatches, not just match/no-match. This is what validates
+/// the v2 leftmost-longest mode against the real thing.
+#[test]
+fn differential_posix_captures_against_bash_oracle() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // On a match, bash answers `1<US>group0<US>group1…`; unmatched optional
+    // groups are empty strings in BASH_REMATCH, matching our
+    // `get(i).unwrap_or_default()` view. US (0x1f) can't occur in
+    // generated text.
+    let script = r#"while IFS= read -r pat && IFS= read -r text; do
+        if [[ $text =~ $pat ]]; then
+            printf 1
+            for g in "${BASH_REMATCH[@]}"; do printf '\x1f%s' "$g"; done
+            printf '\n'
+        else echo 0; fi
+    done"#;
+    let spawned = Command::new("bash")
+        .args(["-c", script])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(_) => {
+            eprintln!("bash not available; skipping oracle test");
+            return;
+        }
+    };
+
+    let mut rng = Rng(0xD1FF_0CA5_E5B0_0003);
+    let mut cases = Vec::new();
+    let mut input = String::new();
+    for _ in 0..CASES {
+        let pattern = gen_pattern(&mut rng, false);
+        let text = gen_text(&mut rng);
+        input.push_str(&pattern);
+        input.push('\n');
+        input.push_str(&text);
+        input.push('\n');
+        cases.push((pattern, text));
+    }
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "bash oracle exited with an error");
+    let answers: Vec<&str> = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .collect();
+    assert_eq!(answers.len(), cases.len(), "oracle answered fewer cases");
+
+    for ((pattern, text), answer) in cases.iter().zip(answers) {
+        let re =
+            Regex::new_posix(pattern).unwrap_or_else(|e| panic!("we rejected {pattern:?}: {e}"));
+        let ours = re.captures(text).map(|caps| {
+            (0..caps.len())
+                .map(|i| caps.get(i).unwrap_or_default().to_owned())
+                .collect::<Vec<String>>()
+        });
+        let bash: Option<Vec<String>> = answer
+            .strip_prefix('1')
+            .map(|rest| rest.split('\x1f').skip(1).map(str::to_owned).collect());
+        // Group 0 — the overall leftmost-longest match — must agree with
+        // bash exactly; this is the divergence the mode exists to close.
+        assert_eq!(
+            ours.as_ref().map(|g| &g[0]),
+            bash.as_ref().map(|g| &g[0]),
+            "POSIX overall-match divergence on pattern {pattern:?}, text {text:?} (ours = left)"
+        );
+        // Submatches must agree too, except where glibc deviates from the
+        // POSIX longest-alternative rule (see KNOWN_GLIBC_SUBMATCH_QUIRKS).
+        if ours != bash && !known_glibc_submatch_quirk(pattern, text) {
+            panic!(
+                "POSIX submatch divergence on pattern {pattern:?}, text {text:?}\n  ours: {ours:?}\n  bash: {bash:?}"
+            );
+        }
+    }
+}
+
+/// glibc (what bash uses) does not implement the POSIX rule that an
+/// alternation prefers its longest-matching branch *inside a repetition
+/// iteration*: it can report a shorter branch for the final iteration when
+/// a longer one is available (a long-known glibc nonconformance; our
+/// engine follows POSIX). Divergent cases confirmed by hand go here so the
+/// harness stays exact everywhere else.
+fn known_glibc_submatch_quirk(pattern: &str, text: &str) -> bool {
+    const KNOWN_GLIBC_SUBMATCH_QUIRKS: &[(&str, &str)] = &[];
+    KNOWN_GLIBC_SUBMATCH_QUIRKS.contains(&(pattern, text))
 }

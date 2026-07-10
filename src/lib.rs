@@ -48,17 +48,34 @@ pub use error::Error;
 #[derive(Debug)]
 pub struct Regex {
     program: compile::Program,
+    posix: bool,
 }
 
 impl Regex {
-    /// Compiles a POSIX-ERE pattern.
+    /// Compiles a POSIX-ERE pattern with leftmost-first (Perl-style) match
+    /// semantics — identical to the `regex` crate's behavior.
     ///
     /// Returns a structured [`Error`] describing the first problem found in
     /// the pattern.
     pub fn new(pattern: &str) -> Result<Regex, Error> {
+        Self::compile(pattern, false)
+    }
+
+    /// Compiles a POSIX-ERE pattern with POSIX leftmost-longest match
+    /// semantics — what real bash/glibc `=~` reports (v2 opt-in mode).
+    ///
+    /// Where [`Regex::new`] matches `a|ab` against `"ab"` as `"a"` (first
+    /// alternative wins), this mode matches `"ab"` (longest wins).
+    /// Submatches use leftmost-longest disambiguation per group in index
+    /// order. Still linear-space and polynomial-time — never backtracking.
+    pub fn new_posix(pattern: &str) -> Result<Regex, Error> {
+        Self::compile(pattern, true)
+    }
+
+    fn compile(pattern: &str, posix: bool) -> Result<Regex, Error> {
         let ast = parser::parse(pattern)?;
         let program = compile::compile(&ast)?;
-        Ok(Regex { program })
+        Ok(Regex { program, posix })
     }
 
     /// Searches `text` for the leftmost match, returning the capture groups.
@@ -66,7 +83,12 @@ impl Regex {
     /// Group 0 is always the whole match. Groups that did not participate in
     /// the match report as absent via [`Captures::get`].
     pub fn captures<'t>(&self, text: &'t str) -> Option<Captures<'t>> {
-        vm::exec(&self.program, text).map(|slots| Captures { text, slots })
+        let slots = if self.posix {
+            vm::exec_posix(&self.program, text)
+        } else {
+            vm::exec(&self.program, text)
+        };
+        slots.map(|slots| Captures { text, slots })
     }
 }
 

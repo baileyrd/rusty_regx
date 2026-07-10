@@ -27,6 +27,10 @@ pub enum Ast {
         min: u32,
         /// `None` means unbounded (`*`, `+`, `{m,}`).
         max: Option<u32>,
+        /// Base index of this repetition's hidden span-tag slot pair, used
+        /// by POSIX-mode disambiguation. The parser leaves it 0; the
+        /// compiler assigns real slots in a numbering pass.
+        slot: usize,
     },
 }
 

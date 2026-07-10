@@ -175,6 +175,68 @@ fn repetition_size_limits() {
     assert!(Regex::new("a{1000}").is_ok());
 }
 
+/// Group 0 under POSIX (leftmost-longest) semantics.
+fn find_posix<'t>(pattern: &str, text: &'t str) -> Option<&'t str> {
+    Regex::new_posix(pattern)
+        .expect(pattern)
+        .captures(text)
+        .and_then(|caps| caps.get(0))
+}
+
+fn groups_posix(pattern: &str, text: &str) -> Option<Vec<Option<String>>> {
+    Regex::new_posix(pattern)
+        .expect(pattern)
+        .captures(text)
+        .map(|caps| {
+            (0..caps.len())
+                .map(|i| caps.get(i).map(str::to_owned))
+                .collect()
+        })
+}
+
+#[test]
+fn posix_mode_is_leftmost_longest() {
+    // The flagship divergence this mode exists to close: real bash matches
+    // the longest alternative, not the first.
+    assert_eq!(find("a|ab", "xab"), Some("a"));
+    assert_eq!(find_posix("a|ab", "xab"), Some("ab"));
+    assert_eq!(find_posix("ab|a", "xab"), Some("ab"));
+
+    // The classic POSIX composition test: overall-longest wins even when
+    // that forces a shorter first alternative.
+    assert_eq!(
+        groups_posix("(a|ab)(c|bcd)", "abcd"),
+        Some(vec![
+            Some("abcd".into()),
+            Some("a".into()),
+            Some("bcd".into())
+        ])
+    );
+
+    // Leftmost still beats longest: a later, longer match never wins.
+    assert_eq!(find_posix("aa|b+", "xaabbb"), Some("aa"));
+}
+
+#[test]
+fn posix_mode_agrees_where_semantics_coincide() {
+    assert_eq!(find_posix("a+", "xxaayaaa"), Some("aa"));
+    assert_eq!(find_posix("a*", "aaa"), Some("aaa"));
+    assert_eq!(find_posix("^abc$", "abc"), Some("abc"));
+    assert_eq!(find_posix("z", "abc"), None);
+    assert_eq!(
+        groups_posix("^([[:alpha:]]+)-([0-9]{2,4})$", "release-2026"),
+        Some(vec![
+            Some("release-2026".into()),
+            Some("release".into()),
+            Some("2026".into())
+        ])
+    );
+    assert_eq!(
+        groups_posix("(x)?(b)", "abc"),
+        Some(vec![Some("b".into()), None, Some("b".into())])
+    );
+}
+
 /// The non-negotiable property: patterns that make backtracking engines
 /// exponential must finish instantly. The assertions are generous (CI
 /// machines vary) — a backtracker would need longer than the age of the
@@ -189,6 +251,12 @@ fn adversarial_patterns_are_linear_time() {
     assert_eq!(find("(a|aa)*b", &a60), None);
     assert_eq!(find("(a|a?)+b", &a60), None);
     assert_eq!(find("(a{2,10}){2,10}b", &a60), None);
+
+    // POSIX mode is polynomial, not exponential — same patterns must
+    // finish instantly there too.
+    assert_eq!(find_posix("(a+)+b", &a60), None);
+    assert_eq!(find_posix("(a|aa)*b", &a60), None);
+    assert_eq!(find_posix("(a|a?)+b", &a60), None);
 
     // And the matching variants must still match.
     let mut ab = "a".repeat(500);
