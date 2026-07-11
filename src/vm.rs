@@ -23,7 +23,7 @@
 //! by RE2's POSIX mode, matching what bash/glibc report.
 
 use crate::ast::{Class, PosixClass};
-use crate::compile::{Inst, Program};
+use crate::compile::{fold, Inst, Program};
 
 /// Byte offsets recorded by `Save`; two slots per group.
 type Slots = Vec<Option<usize>>;
@@ -50,12 +50,15 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
             None => (len, None),
         };
         let next_pos = pos + c.map_or(0, char::len_utf8);
+        // The pattern side was folded at compile time; fold the input to
+        // match. Positions (and so captures) always use the original text.
+        let fc = if program.icase { c.map(fold) } else { c };
         visited.fill(false);
         nlist.clear();
         for (pc, slots) in clist.drain(..) {
             match &program.insts[pc] {
                 Inst::Char(x) => {
-                    if c == Some(*x) {
+                    if fc == Some(*x) {
                         add_thread(
                             program,
                             &mut nlist,
@@ -81,7 +84,7 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
                     }
                 }
                 Inst::Class(class) => {
-                    if c.is_some_and(|ch| class_matches(class, ch)) {
+                    if fc.is_some_and(|ch| class_matches(class, ch)) {
                         add_thread(
                             program,
                             &mut nlist,
@@ -202,10 +205,11 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
             None => (len, None),
         };
         let next_pos = pos + c.map_or(0, char::len_utf8);
+        let fc = if program.icase { c.map(fold) } else { c };
         for (pc, slots) in clist.drain(..) {
             match &program.insts[pc] {
                 Inst::Char(x) => {
-                    if c == Some(*x) {
+                    if fc == Some(*x) {
                         closure_posix(program, &mut best, &mut order, pc + 1, slots, next_pos, len);
                     }
                 }
@@ -215,7 +219,7 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
                     }
                 }
                 Inst::Class(class) => {
-                    if c.is_some_and(|ch| class_matches(class, ch)) {
+                    if fc.is_some_and(|ch| class_matches(class, ch)) {
                         closure_posix(program, &mut best, &mut order, pc + 1, slots, next_pos, len);
                     }
                 }

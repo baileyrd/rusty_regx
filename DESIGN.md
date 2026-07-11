@@ -81,5 +81,12 @@ Other decisions:
    second VM execution mode that replaces priority-based disambiguation with
    capture-vector comparison over hidden repetition span tags, compared in
    syntactic pre-order. Polynomial worst case, never exponential.)*
+7. **(v3) Case-insensitive mode** — `REG_ICASE` semantics for rush's
+   `shopt -s nocasematch` + `=~`. *(Done: `Regex::new_posix_ci`. Follows
+   glibc's model, verified differentially against bash 5.2: pattern
+   literals, range endpoints, and input all fold to uppercase (simple,
+   single-char — ASCII + Unicode); `[[:upper:]]`/`[[:lower:]]` both become
+   `[[:alpha:]]`; ranges reversed after folding are errors; captures always
+   report the original, unfolded input spans.)*
 
 Estimated size: ~1.5–2.5k lines of engine + a comparable test volume.
