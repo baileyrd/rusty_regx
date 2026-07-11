@@ -237,6 +237,129 @@ fn posix_mode_agrees_where_semantics_coincide() {
     );
 }
 
+/// Group 0 under case-insensitive POSIX (`REG_ICASE`) semantics.
+fn find_ci<'t>(pattern: &str, text: &'t str) -> Option<&'t str> {
+    Regex::new_posix_ci(pattern)
+        .expect(pattern)
+        .captures(text)
+        .and_then(|caps| caps.get(0))
+}
+
+fn groups_ci(pattern: &str, text: &str) -> Option<Vec<Option<String>>> {
+    Regex::new_posix_ci(pattern)
+        .expect(pattern)
+        .captures(text)
+        .map(|caps| {
+            (0..caps.len())
+                .map(|i| caps.get(i).map(str::to_owned))
+                .collect()
+        })
+}
+
+// Every assertion in the posix_ci tests below mirrors a probe run against
+// bash 5.2 / glibc 2.39 with `shopt -s nocasematch` — the handoff's
+// instruction was to capture bash's *actual* behavior, not the guesses.
+
+#[test]
+fn posix_ci_folds_ordinary_letters() {
+    // The gap this mode exists to close: `shopt -s nocasematch; [[ ABC =~ ^abc$ ]]`.
+    assert_eq!(find_ci("^abc$", "ABC"), Some("ABC"));
+    assert_eq!(find_ci("^ABC$", "abc"), Some("abc"));
+    assert_eq!(find_ci("B", "abc"), Some("b"));
+    // Folding is opt-in: the case-sensitive constructors are unaffected.
+    assert_eq!(find_posix("^abc$", "ABC"), None);
+    assert_eq!(find("^abc$", "ABC"), None);
+    // Unicode simple folding (matches bash in a UTF-8 locale).
+    assert_eq!(find_ci("é", "É"), Some("É"));
+    assert_eq!(find_ci("Σ", "σ"), Some("σ"));
+    assert_eq!(find_ci("Σ", "ς"), Some("ς")); // final sigma uppercases to Σ
+    assert_eq!(find_ci("i", "İ"), None); // İ's uppercase is itself, not I
+}
+
+#[test]
+fn posix_ci_folds_range_endpoints() {
+    // REG_ICASE folds range endpoints (to uppercase, like glibc): `[X-Z]`
+    // also matches x–z, but `a` is still outside the folded range.
+    assert_eq!(find_ci("[X-Z]bc", "xbc"), Some("xbc"));
+    assert_eq!(find_ci("[X-Z]bc", "abc"), None);
+    assert_eq!(find_ci("[x-z]bc", "Xbc"), Some("Xbc"));
+    assert_eq!(find_ci("[a-f]bc", "Abc"), Some("Abc"));
+    assert_eq!(find_ci("[A-F]bc", "abc"), Some("abc"));
+    assert_eq!(find_ci("[a-f]", "G"), None);
+    assert_eq!(find_ci("[A-F]", "g"), None);
+    // Upper-folding, not lower-folding, is what bash/glibc do: `[A-_]`
+    // stays A(0x41)–_(0x5F), so input `b` folds to `B` and matches.
+    assert_eq!(find_ci("[A-_]", "b"), Some("b"));
+    assert_eq!(find_ci("[a-{]", "B"), Some("B"));
+}
+
+#[test]
+fn posix_ci_range_reversed_after_folding_is_an_error() {
+    // `[Z-a]` is a valid range case-sensitively, but folds to `[Z-A]`;
+    // bash rejects it under nocasematch (exit 2 from `=~`).
+    assert!(Regex::new_posix("[Z-a]").is_ok());
+    assert_eq!(
+        Regex::new_posix_ci("[Z-a]").unwrap_err(),
+        Error::InvalidRange
+    );
+}
+
+#[test]
+fn posix_ci_upper_and_lower_classes_become_alpha() {
+    // glibc's REG_ICASE rule: [[:upper:]] and [[:lower:]] both behave as
+    // [[:alpha:]]. (The handoff guessed named classes keep their literal
+    // meaning; bash 5.2 says otherwise.)
+    assert_eq!(find_ci("[[:lower:]]bc", "ABC"), Some("ABC"));
+    assert_eq!(find_ci("[[:upper:]]bc", "abc"), Some("abc"));
+    assert_eq!(find_ci("[^[:lower:]]", "A"), None);
+    assert_eq!(find_ci("[^[:upper:]]", "a"), None);
+    // Case-symmetric classes are unaffected.
+    assert_eq!(find_ci("[[:digit:]]+", "abc123"), Some("123"));
+    assert_eq!(find_ci("[[:xdigit:]]+", "zzCAFEzz"), Some("CAFE"));
+}
+
+#[test]
+fn posix_ci_folds_before_negation() {
+    assert_eq!(find_ci("[^a-z]", "A"), None);
+    assert_eq!(find_ci("[^A-Z]", "a"), None);
+    assert_eq!(find_ci("[^abc]", "A"), None);
+    assert_eq!(find_ci("[^abc]", "d"), Some("d"));
+    assert_eq!(find_ci("[^X-Z]", "B"), Some("B"));
+    assert_eq!(find_ci("[^X-Z]", "y"), None);
+}
+
+#[test]
+fn posix_ci_captures_report_original_case() {
+    // $BASH_REMATCH must see the unfolded input — folding affects
+    // comparison only, never the captured text.
+    assert_eq!(
+        groups_ci("^(a)(b)", "ABC"),
+        Some(vec![Some("AB".into()), Some("A".into()), Some("B".into())])
+    );
+    assert_eq!(
+        groups_ci("^([[:alpha:]]+)-([0-9]{2,4})$", "RELEASE-2026"),
+        Some(vec![
+            Some("RELEASE-2026".into()),
+            Some("RELEASE".into()),
+            Some("2026".into())
+        ])
+    );
+}
+
+#[test]
+fn posix_ci_keeps_leftmost_longest_semantics() {
+    assert_eq!(find_ci("a|ab", "xAB"), Some("AB"));
+    assert_eq!(find_ci("AB|A", "xab"), Some("ab"));
+    assert_eq!(
+        groups_ci("(a|ab)(c|bcd)", "ABCD"),
+        Some(vec![
+            Some("ABCD".into()),
+            Some("A".into()),
+            Some("BCD".into())
+        ])
+    );
+}
+
 /// The non-negotiable property: patterns that make backtracking engines
 /// exponential must finish instantly. The assertions are generous (CI
 /// machines vary) — a backtracker would need longer than the age of the

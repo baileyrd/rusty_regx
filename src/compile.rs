@@ -5,7 +5,7 @@
 //! [`MAX_REPETITION_SIZE`] and an overall [`MAX_PROGRAM_SIZE`] so a pattern
 //! cannot blow up the program size.
 
-use crate::ast::{Ast, Class};
+use crate::ast::{Ast, Class, PosixClass};
 use crate::error::Error;
 
 /// Cap on a single interval bound, mirroring the `regex` crate's limit in
@@ -52,20 +52,44 @@ pub struct Program {
     /// groups and repetition spans outer-first, left-to-right) — the
     /// comparison order for POSIX leftmost-longest disambiguation.
     pub tag_order: Vec<usize>,
+    /// Case-insensitive (`REG_ICASE`) mode: the compiler has already folded
+    /// pattern literals and range endpoints via [`fold`]; the VM must fold
+    /// each input character the same way before comparing.
+    pub icase: bool,
+}
+
+/// The `REG_ICASE` case fold: simple (single-character) uppercase mapping.
+///
+/// glibc — what bash's `=~` uses — implements `REG_ICASE` by uppercasing
+/// both the pattern and the input (`build_upper_buffer` /
+/// `build_wcs_upper_buffer`), so folding to *upper* is load-bearing:
+/// it is what makes `[A-_]` match `b` while `[Z-a]` is an invalid range
+/// under `nocasematch` (both verified against bash 5.2). Characters whose
+/// uppercase form is not a single character (e.g. `ß` → `SS`) fold to
+/// themselves, as in glibc.
+pub fn fold(c: char) -> char {
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(u), None) => u,
+        _ => c,
+    }
 }
 
 /// Compiles an AST into a [`Program`].
 ///
 /// The program begins with an implicit non-greedy "any char" loop so that
 /// execution is an unanchored search, matching bash `=~` semantics.
-pub fn compile(ast: &Ast) -> Result<Program, Error> {
+pub fn compile(ast: &Ast, icase: bool) -> Result<Program, Error> {
     let group_count = max_group(ast) as usize + 1;
     let mut ast = ast.clone();
     let mut tag_order = vec![0];
     let mut next_slot = 2 * group_count;
     number(&mut ast, &mut next_slot, &mut tag_order);
 
-    let mut c = Compiler { insts: Vec::new() };
+    let mut c = Compiler {
+        insts: Vec::new(),
+        icase,
+    };
     // Unanchored-search prefix, non-greedy: prefer starting the match at the
     // current position (leftmost) over consuming another character.
     c.push(Inst::Split {
@@ -83,6 +107,7 @@ pub fn compile(ast: &Ast) -> Result<Program, Error> {
         group_count,
         slot_count: next_slot,
         tag_order,
+        icase,
     })
 }
 
@@ -136,6 +161,7 @@ fn max_group(ast: &Ast) -> u32 {
 
 struct Compiler {
     insts: Vec<Inst>,
+    icase: bool,
 }
 
 impl Compiler {
@@ -156,13 +182,15 @@ impl Compiler {
         match ast {
             Ast::Empty => {}
             Ast::Char(c) => {
-                self.push(Inst::Char(*c))?;
+                let c = if self.icase { fold(*c) } else { *c };
+                self.push(Inst::Char(c))?;
             }
             Ast::AnyChar => {
                 self.push(Inst::AnyChar)?;
             }
             Ast::Class(class) => {
-                self.push(Inst::Class(class.clone()))?;
+                let class = self.fold_class(class)?;
+                self.push(Inst::Class(class))?;
             }
             Ast::StartAnchor => {
                 self.push(Inst::StartAnchor)?;
@@ -190,6 +218,40 @@ impl Compiler {
             } => self.repeat(ast, *min, *max, *slot)?,
         }
         Ok(())
+    }
+
+    /// In `icase` mode, folds a class the way glibc's `REG_ICASE` does:
+    /// range endpoints (including single characters, which are degenerate
+    /// ranges) fold to uppercase, and a range that is reversed *after*
+    /// folding is an error (`[Z-a]` is valid case-sensitively but folds to
+    /// `[Z-A]`; bash rejects it under `nocasematch`). `[[:upper:]]` and
+    /// `[[:lower:]]` both become `[[:alpha:]]` — glibc's documented
+    /// `REG_ICASE` rule, verified against bash 5.2.
+    fn fold_class(&self, class: &Class) -> Result<Class, Error> {
+        if !self.icase {
+            return Ok(class.clone());
+        }
+        let mut ranges = Vec::with_capacity(class.ranges.len());
+        for &(lo, hi) in &class.ranges {
+            let (lo, hi) = (fold(lo), fold(hi));
+            if lo > hi {
+                return Err(Error::InvalidRange);
+            }
+            ranges.push((lo, hi));
+        }
+        let posix = class
+            .posix
+            .iter()
+            .map(|&p| match p {
+                PosixClass::Upper | PosixClass::Lower => PosixClass::Alpha,
+                p => p,
+            })
+            .collect();
+        Ok(Class {
+            negated: class.negated,
+            ranges,
+            posix,
+        })
     }
 
     /// `b1|b2|…|bn`: a chain of splits, each preferring its branch (earlier

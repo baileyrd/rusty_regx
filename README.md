@@ -63,6 +63,21 @@ differential harness; submatch reporting follows the POSIX
 longest-alternative rule, which glibc itself deviates from in rare corners
 (~0.01% of randomly generated cases).
 
+`Regex::new_posix_ci` adds case-insensitive matching on top of the POSIX
+mode — POSIX `REG_ICASE`, which is what bash applies to `=~` under
+`shopt -s nocasematch`. Folding happens per character at comparison time
+(never in the captured text) and matches glibc exactly: literals and range
+endpoints fold, and `[[:upper:]]`/`[[:lower:]]` both behave as
+`[[:alpha:]]`:
+
+```rust
+use rusty_regx::Regex;
+
+let re = Regex::new_posix_ci("^(a)(b)c$")?;
+let caps = re.captures("ABC").unwrap();
+assert_eq!(caps.get(1), Some("A")); // captures keep the original case
+```
+
 See [DESIGN.md](DESIGN.md) for the architecture and full roadmap.
 
 ## License

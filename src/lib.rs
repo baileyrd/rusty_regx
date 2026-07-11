@@ -58,7 +58,7 @@ impl Regex {
     /// Returns a structured [`Error`] describing the first problem found in
     /// the pattern.
     pub fn new(pattern: &str) -> Result<Regex, Error> {
-        Self::compile(pattern, false)
+        Self::compile(pattern, false, false)
     }
 
     /// Compiles a POSIX-ERE pattern with POSIX leftmost-longest match
@@ -69,12 +69,35 @@ impl Regex {
     /// Submatches use leftmost-longest disambiguation per group in index
     /// order. Still linear-space and polynomial-time — never backtracking.
     pub fn new_posix(pattern: &str) -> Result<Regex, Error> {
-        Self::compile(pattern, true)
+        Self::compile(pattern, true, false)
     }
 
-    fn compile(pattern: &str, posix: bool) -> Result<Regex, Error> {
+    /// As [`Regex::new_posix`], but ordinary-letter comparisons are
+    /// case-insensitive (ASCII plus Unicode simple case folding) — POSIX
+    /// `REG_ICASE`, which is what bash applies to `[[ =~ ]]` under
+    /// `shopt -s nocasematch`.
+    ///
+    /// Folding happens per character at comparison time and matches glibc's
+    /// `REG_ICASE` exactly (differentially verified against bash 5.2):
+    ///
+    /// - Pattern literals and input fold to uppercase, so `abc` matches
+    ///   `"ABC"` and vice versa.
+    /// - Range endpoints fold too: `[a-f]` also matches `A`–`F`, `[X-Z]`
+    ///   also matches `x`–`z` — but `a` still does *not* match `[X-Z]`.
+    ///   A range that is reversed after folding (e.g. `[Z-a]`) is an
+    ///   [`Error::InvalidRange`], as glibc rejects it.
+    /// - `[[:upper:]]` and `[[:lower:]]` both behave as `[[:alpha:]]` —
+    ///   glibc's `REG_ICASE` rule, so `[[ ABC =~ [[:lower:]]bc ]]` matches
+    ///   under `nocasematch` in real bash.
+    /// - Folding affects comparison only: captures always report the
+    ///   original input spans, so `^(a)` against `"ABC"` captures `"A"`.
+    pub fn new_posix_ci(pattern: &str) -> Result<Regex, Error> {
+        Self::compile(pattern, true, true)
+    }
+
+    fn compile(pattern: &str, posix: bool, icase: bool) -> Result<Regex, Error> {
         let ast = parser::parse(pattern)?;
-        let program = compile::compile(&ast)?;
+        let program = compile::compile(&ast, icase)?;
         Ok(Regex { program, posix })
     }
 
