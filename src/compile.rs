@@ -127,9 +127,10 @@ pub struct Program {
     /// The literal string every match must start with (empty if none, or
     /// if the program can't use it). The VM may fast-forward the scan to
     /// its next occurrence whenever no live thread carries progress.
-    /// Empty for anchored programs, `icase` mode (the input folds before
-    /// comparing, so a plain substring search would miss case variants),
-    /// and patterns without a mandatory literal head.
+    /// Empty for anchored programs and patterns without a mandatory
+    /// literal head. In `icase` mode the chars are pre-folded and the VM
+    /// scans by folding each input char (`find_prefix`), so the
+    /// case-insensitive modes get fast-forward too.
     pub prefix: String,
     /// Set when the whole pattern is a plain literal (optionally anchored
     /// at either end): the VM bypasses NFA simulation entirely and
@@ -208,8 +209,12 @@ pub fn compile(mut ast: Ast, icase: bool) -> Result<Program, Error> {
     c.push(Inst::Save(1))?;
     c.push(Inst::Match)?;
     let mut prefix = String::new();
-    if !anchored && !icase {
+    if !anchored {
         collect_prefix(&ast, &mut prefix);
+        if icase {
+            // The VM compares folded chars; pre-fold the needle to match.
+            prefix = prefix.chars().map(fold).collect();
+        }
     }
     let mut suffix = String::new();
     if !icase {

@@ -47,6 +47,33 @@ fn literal_span(lit: &Literal, text: &str) -> Option<(usize, usize)> {
     }
 }
 
+/// The scan fast-forward search: a plain substring search, or — in
+/// `icase` mode, where the prefix chars are pre-folded at compile time —
+/// a fold-and-compare scan. The folded scan is O(len * prefix) worst
+/// case, but a fold call per char is far cheaper than stepping the full
+/// thread machinery, which is what the fast-forward replaces.
+fn find_prefix(program: &Program, hay: &str) -> Option<usize> {
+    if !program.icase {
+        return hay.find(&*program.prefix);
+    }
+    let first = program.prefix.chars().next()?;
+    for (i, c) in hay.char_indices() {
+        if fold(c) != first {
+            continue;
+        }
+        let mut want = program.prefix.chars().skip(1);
+        let mut have = hay[i..].chars().skip(1);
+        loop {
+            match (want.next(), have.next()) {
+                (None, _) => return Some(i),
+                (Some(w), Some(h)) if fold(h) == w => {}
+                _ => break,
+            }
+        }
+    }
+    None
+}
+
 /// The mandatory-suffix quick reject: every match must end with
 /// `program.suffix`, so text that doesn't contain it (or doesn't end
 /// with it, for `\$`-anchored patterns) can't match — one substring
@@ -159,7 +186,7 @@ pub fn exec(
         // match before the next occurrence of that char — skip straight
         // to it.
         if !program.prefix.is_empty() && matched.is_none() && at_restart(&clist, &restart, pos) {
-            match text[pos..].find(&*program.prefix) {
+            match find_prefix(program, &text[pos..]) {
                 Some(0) => {}
                 Some(off) => {
                     pos += off;
@@ -324,7 +351,7 @@ pub fn exec_bool(program: &Program, text: &str) -> bool {
     let mut pos = 0;
     loop {
         if !program.prefix.is_empty() && clist == restart {
-            match text[pos..].find(&*program.prefix) {
+            match find_prefix(program, &text[pos..]) {
                 Some(0) => {}
                 Some(off) => pos += off,
                 None => return false,
@@ -454,7 +481,7 @@ pub fn exec_posix(
     let mut pos = 0;
     loop {
         if !program.prefix.is_empty() && best_match.is_none() && at_restart(&clist, &restart, pos) {
-            match text[pos..].find(&*program.prefix) {
+            match find_prefix(program, &text[pos..]) {
                 Some(0) => {}
                 Some(off) => {
                     pos += off;

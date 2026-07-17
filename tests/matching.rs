@@ -599,6 +599,41 @@ fn groups_ci(pattern: &str, text: &str) -> Option<Vec<Option<String>>> {
 // bash 5.2 / glibc 2.39 with `shopt -s nocasematch` — the handoff's
 // instruction was to capture bash's *actual* behavior, not the guesses.
 
+/// The case-insensitive modes now get scan fast-forward (folded prefix
+/// search): matches deep in mixed-case text must still be found, in
+/// both directions of folding.
+#[test]
+fn icase_prefix_acceleration_preserves_semantics() {
+    let long = "XyZ ".repeat(500);
+    assert_eq!(
+        Regex::new_posix_ci("release-[0-9]+")
+            .unwrap()
+            .captures(&format!("{long}ReLeAsE-77"))
+            .unwrap()
+            .get(0),
+        Some("ReLeAsE-77")
+    );
+    assert_eq!(
+        Regex::new_ci("AbC[0-9]")
+            .unwrap()
+            .captures(&format!("{long}abc9"))
+            .unwrap()
+            .get(0),
+        Some("abc9")
+    );
+    // No-match still terminates via the folded scan.
+    assert!(!Regex::new_ci("qq[0-9]").unwrap().is_match(&long));
+    // Sigma folds: pattern σ (folds to Σ) must find input ς.
+    assert_eq!(
+        Regex::new_ci("σx")
+            .unwrap()
+            .captures(&format!("{long}ςx"))
+            .unwrap()
+            .get(0),
+        Some("ςx")
+    );
+}
+
 #[test]
 fn posix_ci_folds_ordinary_letters() {
     // The gap this mode exists to close: `shopt -s nocasematch; [[ ABC =~ ^abc$ ]]`.
