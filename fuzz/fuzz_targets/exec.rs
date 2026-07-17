@@ -60,16 +60,13 @@ fn span0(re: &Regex, text: &str) -> Option<(usize, usize)> {
         "is_match disagrees with captures"
     );
     let caps = caps?;
-    let g0 = caps.get(0).expect("group 0 must participate in a match");
-    let start = g0.as_ptr() as usize - text.as_ptr() as usize;
-    let end = start + g0.len();
+    let (start, end) = caps.span(0).expect("group 0 must participate");
     for i in 1..caps.len() {
-        if let Some(g) = caps.get(i) {
-            let s = g.as_ptr() as usize - text.as_ptr() as usize;
-            assert!(
-                s >= start && s + g.len() <= end,
-                "group {i} outside group 0"
-            );
+        // get() slicing proves every span is on UTF-8 boundaries.
+        let (g, span) = (caps.get(i), caps.span(i));
+        assert_eq!(g.is_some(), span.is_some(), "get/span disagree on {i}");
+        if let Some((s, e)) = span {
+            assert!(s >= start && e <= end, "group {i} outside group 0");
         }
     }
     Some((start, end))

@@ -227,6 +227,42 @@ fn new_ci_is_leftmost_first_and_case_insensitive() {
     );
 }
 
+/// The VM uses `Rc` internally (copy-on-write capture slots); this fails
+/// to compile if that ever leaks into the public types.
+#[test]
+fn regex_is_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Regex>();
+    assert_send_sync::<rusty_regx::Captures<'_>>();
+    assert_send_sync::<rusty_regx::Error>();
+}
+
+#[test]
+fn spans_iter_and_index() {
+    let re = Regex::new("(a)(x)?(b)").unwrap();
+    let caps = re.captures("zzab").unwrap();
+    assert_eq!(caps.span(0), Some((2, 4)));
+    assert_eq!(caps.span(1), Some((2, 3)));
+    assert_eq!(caps.span(2), None); // did not participate
+    assert_eq!(caps.span(3), Some((3, 4)));
+    assert_eq!(caps.span(4), None); // out of range
+                                    // Spans fall on char boundaries in multibyte text.
+    let caps = Regex::new("(é)").unwrap().captures("xéy").unwrap();
+    assert_eq!(caps.span(1), Some((1, 3)));
+    // iter() yields every group in order, absent ones as None.
+    let re = Regex::new("(a)(x)?(b)").unwrap();
+    let caps = re.captures("zzab").unwrap();
+    let all: Vec<Option<&str>> = caps.iter().collect();
+    assert_eq!(all, vec![Some("ab"), Some("a"), None, Some("b")]);
+    // Indexing panics only on absent groups.
+    assert_eq!(&caps[0], "ab");
+    assert_eq!(&caps[3], "b");
+    assert!(std::panic::catch_unwind(|| {
+        let _ = &caps[2];
+    })
+    .is_err());
+}
+
 #[test]
 fn regex_reports_its_pattern() {
     let re = Regex::new("a|b").unwrap();
