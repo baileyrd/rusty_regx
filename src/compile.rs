@@ -43,14 +43,74 @@ pub enum Inst {
     Match,
 }
 
+/// A compiled bracket expression: ASCII membership precomputed as a
+/// 128-bit table (negation and POSIX classes folded in — one bit test
+/// per input char on the VM's hottest path), with the general
+/// range/POSIX logic as the non-ASCII fallback.
+#[derive(Debug, Clone)]
+pub struct CompiledClass {
+    ascii: [u64; 2],
+    class: Class,
+}
+
+impl CompiledClass {
+    fn new(class: Class) -> CompiledClass {
+        let mut ascii = [0u64; 2];
+        for b in 0..128u32 {
+            let c = char::from_u32(b).expect("ASCII");
+            if class_matches_general(&class, c) {
+                ascii[(b / 64) as usize] |= 1 << (b % 64);
+            }
+        }
+        CompiledClass { ascii, class }
+    }
+
+    /// Whether `c` is in the class.
+    pub fn matches(&self, c: char) -> bool {
+        let b = c as u32;
+        if b < 128 {
+            self.ascii[(b / 64) as usize] & (1 << (b % 64)) != 0
+        } else {
+            class_matches_general(&self.class, c)
+        }
+    }
+}
+
+/// The general membership test: binary search over the compile-time
+/// sorted-and-merged ranges (see `normalize_ranges`), then the POSIX
+/// classes, then negation.
+fn class_matches_general(class: &Class, c: char) -> bool {
+    let i = class.ranges.partition_point(|&(lo, _)| lo <= c);
+    let hit =
+        (i > 0 && class.ranges[i - 1].1 >= c) || class.posix.iter().any(|&p| posix_matches(p, c));
+    hit != class.negated
+}
+
+/// POSIX classes are ASCII-first, with `char` method fallbacks where they
+/// have a sensible Unicode meaning (per DESIGN.md — no Unicode tables).
+fn posix_matches(class: PosixClass, c: char) -> bool {
+    match class {
+        PosixClass::Alnum => c.is_alphanumeric(),
+        PosixClass::Alpha => c.is_alphabetic(),
+        PosixClass::Blank => c == ' ' || c == '\t',
+        PosixClass::Cntrl => c.is_control(),
+        PosixClass::Digit => c.is_ascii_digit(),
+        PosixClass::Graph => c.is_ascii_graphic(),
+        PosixClass::Lower => c.is_lowercase(),
+        PosixClass::Print => c.is_ascii_graphic() || c == ' ',
+        PosixClass::Punct => c.is_ascii_punctuation(),
+        PosixClass::Space => c.is_whitespace(),
+        PosixClass::Upper => c.is_uppercase(),
+        PosixClass::Xdigit => c.is_ascii_hexdigit(),
+    }
+}
+
 /// A compiled program.
 #[derive(Debug, Clone)]
 pub struct Program {
     pub insts: Vec<Inst>,
     /// Interned bracket expressions, referenced by `Inst::Class` index.
-    /// Ranges are normalized at compile time: sorted by start and merged,
-    /// so the VM can binary-search them.
-    pub classes: Vec<Class>,
+    pub classes: Vec<CompiledClass>,
     /// Number of capture groups including group 0.
     pub group_count: usize,
     /// Total `Save` slots: two per group, plus two per repetition (hidden
@@ -67,14 +127,23 @@ pub struct Program {
     /// The literal string every match must start with (empty if none, or
     /// if the program can't use it). The VM may fast-forward the scan to
     /// its next occurrence whenever no live thread carries progress.
-    /// Empty for anchored programs, `icase` mode (the input folds before
-    /// comparing, so a plain substring search would miss case variants),
-    /// and patterns without a mandatory literal head.
+    /// Empty for anchored programs and patterns without a mandatory
+    /// literal head. In `icase` mode the chars are pre-folded and the VM
+    /// scans by folding each input char (`find_prefix`), so the
+    /// case-insensitive modes get fast-forward too.
     pub prefix: String,
     /// Set when the whole pattern is a plain literal (optionally anchored
     /// at either end): the VM bypasses NFA simulation entirely and
     /// matches by substring search. Never set in `icase` mode.
     pub literal: Option<Literal>,
+    /// The literal string every match must end with (empty if none):
+    /// a no-match rejects with one substring scan before any VM work.
+    /// Empty in `icase` mode.
+    pub suffix: String,
+    /// Whether every match must end at the input's end (`$` on every
+    /// branch) — upgrades the suffix check from `contains` to
+    /// `ends_with`.
+    pub suffix_anchored: bool,
 }
 
 /// A pattern that is a plain literal, matched by substring search.
@@ -140,10 +209,26 @@ pub fn compile(mut ast: Ast, icase: bool) -> Result<Program, Error> {
     c.push(Inst::Save(1))?;
     c.push(Inst::Match)?;
     let mut prefix = String::new();
-    if !anchored && !icase {
+    if !anchored {
         collect_prefix(&ast, &mut prefix);
+        if icase {
+            // The VM compares folded chars; pre-fold the needle to match.
+            prefix = prefix.chars().map(fold).collect();
+        }
     }
-    let literal = if icase { None } else { literal_of(&ast) };
+    let mut suffix = String::new();
+    if !icase {
+        collect_suffix_rev(&ast, &mut suffix);
+        suffix = suffix.chars().rev().collect();
+    }
+    let suffix_anchored = ends_anchored(&ast);
+    // Groups need real capture tracking; the substring path reports only
+    // group 0.
+    let literal = if icase || group_count > 1 {
+        None
+    } else {
+        literal_of(&ast)
+    };
     Ok(Program {
         insts: c.insts,
         classes: c.classes,
@@ -153,6 +238,8 @@ pub fn compile(mut ast: Ast, icase: bool) -> Result<Program, Error> {
         icase,
         prefix,
         literal,
+        suffix,
+        suffix_anchored,
     })
 }
 
@@ -180,10 +267,12 @@ fn literal_of(ast: &Ast) -> Option<Literal> {
         lit.anchored_end = true;
         items = &items[..items.len() - 1];
     }
+    // Every remaining item must be *exactly* its literal — Chars, exact
+    // repetitions of literals, Empty (the caller has already excluded
+    // patterns with groups).
     for item in items {
-        match item {
-            Ast::Char(c) => lit.s.push(*c),
-            _ => return None,
+        if !collect_prefix(item, &mut lit.s) {
+            return None;
         }
     }
     Some(lit)
@@ -209,6 +298,7 @@ fn starts_anchored(ast: &Ast) -> bool {
 /// past it). Conservative: anything uncertain ends the prefix.
 fn collect_prefix(ast: &Ast, out: &mut String) -> bool {
     match ast {
+        Ast::Empty => true,
         Ast::Char(c) => {
             out.push(*c);
             true
@@ -238,6 +328,65 @@ fn collect_prefix(ast: &Ast, out: &mut String) -> bool {
             });
             let mut common = prefixes.next().unwrap_or_default();
             for p in prefixes {
+                let shared = common
+                    .chars()
+                    .zip(p.chars())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| a.len_utf8())
+                    .sum();
+                common.truncate(shared);
+            }
+            out.push_str(&common);
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Whether every match of `ast` must end at the input's end — the mirror
+/// of `starts_anchored`.
+fn ends_anchored(ast: &Ast) -> bool {
+    match ast {
+        Ast::EndAnchor => true,
+        Ast::Concat(items) => items.last().is_some_and(ends_anchored),
+        Ast::Alternation(branches) => branches.iter().all(ends_anchored),
+        Ast::Group(_, inner) => ends_anchored(inner),
+        Ast::Repeat { ast, min, .. } => *min >= 1 && ends_anchored(ast),
+        _ => false,
+    }
+}
+
+/// The mirror of `collect_prefix`: accumulates the mandatory literal
+/// suffix in *reverse char order* into `out` (the caller un-reverses).
+/// Returns whether the construct is exactly its literal.
+fn collect_suffix_rev(ast: &Ast, out: &mut String) -> bool {
+    match ast {
+        Ast::Empty => true,
+        Ast::Char(c) => {
+            out.push(*c);
+            true
+        }
+        Ast::Concat(items) => items.iter().rev().all(|item| collect_suffix_rev(item, out)),
+        Ast::Group(_, inner) => collect_suffix_rev(inner, out),
+        Ast::Repeat { ast, min, max, .. } if *min >= 1 => {
+            let start = out.len();
+            if !collect_suffix_rev(ast, out) {
+                return false;
+            }
+            let body = out[start..].to_string();
+            for _ in 1..*min {
+                out.push_str(&body);
+            }
+            *max == Some(*min)
+        }
+        Ast::Alternation(branches) => {
+            let mut suffixes = branches.iter().map(|b| {
+                let mut p = String::new();
+                collect_suffix_rev(b, &mut p);
+                p
+            });
+            let mut common = suffixes.next().unwrap_or_default();
+            for p in suffixes {
                 let shared = common
                     .chars()
                     .zip(p.chars())
@@ -303,7 +452,7 @@ fn max_group(ast: &Ast) -> u32 {
 
 struct Compiler {
     insts: Vec<Inst>,
-    classes: Vec<Class>,
+    classes: Vec<CompiledClass>,
     icase: bool,
 }
 
@@ -353,7 +502,7 @@ impl Compiler {
                 let mut class = self.fold_class(class)?;
                 normalize_ranges(&mut class.ranges);
                 let index = self.classes.len();
-                self.classes.push(class);
+                self.classes.push(CompiledClass::new(class));
                 self.push(Inst::Class(index))?;
             }
             Ast::StartAnchor => {

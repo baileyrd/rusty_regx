@@ -42,9 +42,32 @@ pub fn escape(text: &str) -> String;  // escapes exactly THIS engine's metachars
 ## Architecture
 
 ```
-&str pattern ─▶ ERE parser ─▶ AST ─▶ bytecode compiler ─▶ Pike VM
+&str pattern ─▶ ERE parser ─▶ AST ─▶ bytecode compiler ─▶ execution tiers
                                       Char / Class / Split / Jump / Save / Match
 ```
+
+Compilation analyzes the AST once and picks the cheapest execution
+strategy at match time (all tiers preserve identical semantics; each is
+pinned by tests and fuzz invariants):
+
+1. **Literal substring path** — a group-free pattern that is exactly its
+   mandatory literal (optionally `^`/`$`-anchored; what rush's
+   `escape()` produces) never touches the NFA: `find`/`starts_with`/
+   `ends_with`/`==` do the whole job.
+2. **Suffix quick reject** — any pattern with a mandatory literal suffix
+   rejects non-matching text with one substring scan before VM work.
+3. **Anchored fast path** — start-anchored patterns compile without the
+   unanchored `.*?` prefix, so the thread list empties (and the search
+   ends) as soon as position 0 fails.
+4. **Prefix fast-forward** — when a mandatory literal prefix exists and
+   no live thread carries progress, the scan skips straight to its next
+   occurrence (`str::find`; a fold-and-compare scan in `REG_ICASE`
+   mode, where the prefix is pre-folded).
+5. **Pike VM** — everything else: breadth-first NFA simulation with
+   copy-on-write capture slots, generation-stamped visited sets, interned
+   classes with precomputed 128-bit ASCII membership, and one shared
+   step dispatcher across the three modes (leftmost-first captures,
+   POSIX leftmost-longest via best-wins closure, capture-free boolean).
 
 **Non-negotiable: no backtracking.** A shell compiles user-supplied patterns;
 the engine must be linear-time (Pike VM — breadth-first NFA simulation with

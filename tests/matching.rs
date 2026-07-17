@@ -382,6 +382,76 @@ fn find_agrees_with_captures_span_in_every_mode() {
     );
 }
 
+/// Iteration semantics: non-overlapping, leftmost, empty matches
+/// advance one char. The regex crate is the oracle where the engines'
+/// semantics coincide (leftmost-first, no by-design divergent syntax).
+#[test]
+fn find_iter_agrees_with_regex_crate() {
+    let cases = [
+        ("a+", "aa b aaa"),
+        ("a*", "aab"),
+        ("", "é a"),
+        ("ab", "ababab"),
+        ("[0-9]+", "1 22 333"),
+        ("a", "zzz"),
+        ("(a)(b)?", "ab a ab"),
+    ];
+    for (pattern, text) in cases {
+        let ours: Vec<(usize, usize)> = Regex::new(pattern)
+            .unwrap()
+            .find_iter(text)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        let theirs: Vec<(usize, usize)> = regex::Regex::new(pattern)
+            .unwrap()
+            .find_iter(text)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        assert_eq!(
+            ours, theirs,
+            "find_iter divergence on {pattern:?} / {text:?}"
+        );
+    }
+}
+
+#[test]
+fn iteration_semantics() {
+    // Anchors keep absolute meaning across restarts: ^ matches only the
+    // true start, $ only the true end.
+    let spans = |p: &str, t: &str| -> Vec<(usize, usize)> {
+        Regex::new(p)
+            .unwrap()
+            .find_iter(t)
+            .map(|m| (m.start(), m.end()))
+            .collect()
+    };
+    assert_eq!(spans("^a", "aaa"), vec![(0, 1)]);
+    assert_eq!(spans("a$", "aaa"), vec![(2, 3)]);
+    assert_eq!(spans("^a+$", "aaa"), vec![(0, 3)]);
+    // Empty-match advance is char-based, never splitting a multibyte char.
+    assert_eq!(spans("x*", "éé"), vec![(0, 0), (2, 2), (4, 4)]);
+    // POSIX mode: each match is leftmost-longest.
+    let posix: Vec<&str> = Regex::new_posix("a|ab")
+        .unwrap()
+        .find_iter("ab ab")
+        .map(|m| m.as_str())
+        .collect();
+    assert_eq!(posix, vec!["ab", "ab"]);
+    // captures_iter carries per-match groups.
+    let caps: Vec<(Option<String>, Option<String>)> = Regex::new("(a)(b)?")
+        .unwrap()
+        .captures_iter("ab a")
+        .map(|c| (c.get(1).map(String::from), c.get(2).map(String::from)))
+        .collect();
+    assert_eq!(
+        caps,
+        vec![
+            (Some("a".into()), Some("b".into())),
+            (Some("a".into()), None)
+        ]
+    );
+}
+
 #[test]
 fn group_count_and_from_str() {
     assert_eq!(Regex::new("abc").unwrap().group_count(), 1);
@@ -436,6 +506,42 @@ fn literal_fast_path_matches_vm_semantics() {
             .get(0),
         Some("ABC")
     );
+}
+
+/// Group-free exactly-literal patterns (incl. exact repetitions and the
+/// empty pattern) take the substring path; group-bearing ones must not.
+#[test]
+fn literal_fast_path_generalizations() {
+    assert_eq!(find("a{3}", "xxaaay"), Some("aaa"));
+    assert_eq!(find("ab{2}c", "zabbcz"), Some("abbc"));
+    assert_eq!(find("^a{2}$", "aa"), Some("aa"));
+    assert_eq!(find("^a{2}$", "aaa"), None);
+    assert_eq!(find("", "xy"), Some(""));
+    assert_eq!(find("", ""), Some(""));
+    // A group forces real capture tracking — group 1 must still report.
+    assert_eq!(
+        groups("(a){3}", "aaa"),
+        Some(vec![Some("aaa".into()), Some("a".into())])
+    );
+}
+
+/// The mandatory-suffix quick reject must never veto a real match.
+#[test]
+fn suffix_quick_reject_preserves_semantics() {
+    // Rejects (no "@x.com" anywhere / at end) and accepts.
+    assert_eq!(find("[a-z]+@x\\.com", "aaa bbb ccc"), None);
+    assert_eq!(find("[a-z]+@x\\.com", "hi bob@x.com!"), Some("bob@x.com"));
+    assert_eq!(find("[a-z]+@x\\.com$", "bob@x.com later"), None);
+    assert_eq!(find("[a-z]+@x\\.com$", "mail bob@x.com"), Some("bob@x.com"));
+    // Suffix through groups, exact repetitions, and alternation LCS.
+    assert_eq!(find("[0-9]+(ab){2}", "7abab"), Some("7abab"));
+    assert_eq!(find("[0-9]+(xa|ya)", "3ya"), Some("3ya"));
+    assert_eq!(find("[0-9]+(xa|ya)", "3yb"), None);
+    // Open-ended repetition tails contribute their body once.
+    assert_eq!(find(".b{2,}", "xbbb"), Some("xbbb"));
+    // POSIX mode takes the same quick reject.
+    assert_eq!(find_posix("[a-z]+@x\\.com", "aaa bbb"), None);
+    assert_eq!(find_posix("[0-9]+(ab){2}", "7abab"), Some("7abab"));
 }
 
 /// Multi-char mandatory prefixes accelerate the scan; these pin the
@@ -562,6 +668,41 @@ fn groups_ci(pattern: &str, text: &str) -> Option<Vec<Option<String>>> {
 // Every assertion in the posix_ci tests below mirrors a probe run against
 // bash 5.2 / glibc 2.39 with `shopt -s nocasematch` — the handoff's
 // instruction was to capture bash's *actual* behavior, not the guesses.
+
+/// The case-insensitive modes now get scan fast-forward (folded prefix
+/// search): matches deep in mixed-case text must still be found, in
+/// both directions of folding.
+#[test]
+fn icase_prefix_acceleration_preserves_semantics() {
+    let long = "XyZ ".repeat(500);
+    assert_eq!(
+        Regex::new_posix_ci("release-[0-9]+")
+            .unwrap()
+            .captures(&format!("{long}ReLeAsE-77"))
+            .unwrap()
+            .get(0),
+        Some("ReLeAsE-77")
+    );
+    assert_eq!(
+        Regex::new_ci("AbC[0-9]")
+            .unwrap()
+            .captures(&format!("{long}abc9"))
+            .unwrap()
+            .get(0),
+        Some("abc9")
+    );
+    // No-match still terminates via the folded scan.
+    assert!(!Regex::new_ci("qq[0-9]").unwrap().is_match(&long));
+    // Sigma folds: pattern σ (folds to Σ) must find input ς.
+    assert_eq!(
+        Regex::new_ci("σx")
+            .unwrap()
+            .captures(&format!("{long}ςx"))
+            .unwrap()
+            .get(0),
+        Some("ςx")
+    );
+}
 
 #[test]
 fn posix_ci_folds_ordinary_letters() {
