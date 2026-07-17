@@ -570,6 +570,64 @@ fn prefix_acceleration_preserves_semantics() {
     assert_eq!(find("(ab?){2}c", &format!("{long}aac")), Some("aac"));
 }
 
+/// GNU/glibc ERE extensions (issue #18) — every assertion here mirrors a
+/// probe run against bash 5.2, the semantics this engine follows.
+#[test]
+fn gnu_word_assertions_and_classes() {
+    // \b / \B / \< / \>
+    assert_eq!(find(r"\bword\b", "a word here"), Some("word"));
+    assert_eq!(find(r"\bord\b", "a word here"), None);
+    assert_eq!(find(r"\w+", "ab_1-x"), Some("ab_1"));
+    assert_eq!(find(r"\W", "ab-c"), Some("-"));
+    assert_eq!(find(r"\s", "a b"), Some(" "));
+    assert_eq!(find(r"\S+", "  hi  "), Some("hi"));
+    assert_eq!(find(r"\<end", "the end"), Some("end"));
+    assert_eq!(find(r"a\>", "a b"), Some("a"));
+    assert_eq!(find(r"\Bb", "ab"), Some("b"));
+    // On the empty string: \B matches, \b doesn't (bash-verified).
+    assert_eq!(find(r"\B", ""), Some(""));
+    assert_eq!(find(r"\b", ""), None);
+    // _ is a word char.
+    assert_eq!(find(r"_\b", "a_ b"), Some("_"));
+    // Inside brackets, POSIX's literal-backslash rule still applies:
+    // [\w] is {backslash, w}, exactly as in glibc.
+    assert_eq!(find(r"[\w]", "w"), Some("w"));
+    assert_eq!(find(r"[\w]", "\\"), Some("\\"));
+    // \` and \' are input anchors.
+    assert_eq!(find(r"\`ab", "ab"), Some("ab"));
+    assert_eq!(find(r"\`b", "ab"), None);
+    assert_eq!(find(r"b\'", "ab"), Some("b"));
+    // Quantifying an assertion directly is a compile error, as in glibc.
+    assert_eq!(
+        Regex::new(r"\b*ab").unwrap_err().kind(),
+        ErrorKind::DanglingQuantifier
+    );
+    assert_eq!(
+        Regex::new(r"\<{2}a").unwrap_err().kind(),
+        ErrorKind::DanglingQuantifier
+    );
+    // ...but a grouped assertion may be quantified.
+    assert_eq!(find(r"(\b)*ab", "ab"), Some("ab"));
+    // {,n} and {,}.
+    assert_eq!(find(r"^a{,2}$", "aa"), Some("aa"));
+    assert_eq!(find(r"^a{,2}$", "aaa"), None);
+    assert_eq!(find(r"^a{,}$", "aaa"), Some("aaa"));
+    // \d stays a literal d, as in glibc.
+    assert_eq!(find(r"\d", "5d"), Some("d"));
+    // POSIX mode and boolean mode share the assertion machinery.
+    assert_eq!(find_posix(r"\bword\b", "a word here"), Some("word"));
+    assert!(Regex::new_posix(r"\<end").unwrap().is_match("the end"));
+    assert!(!Regex::new(r"\bord").unwrap().is_match("a word"));
+    // Word-ness follows the crate's Unicode locale stance: é is alnum.
+    assert_eq!(find(r"\ba", "éa"), None);
+    assert_eq!(find(r"\ba", " a"), Some("a"));
+    // Captures across assertions.
+    assert_eq!(
+        groups(r"\<(\w+)\>", "  hey  "),
+        Some(vec![Some("hey".into()), Some("hey".into())])
+    );
+}
+
 #[test]
 fn repetition_size_limits() {
     assert_eq!(

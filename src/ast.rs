@@ -15,6 +15,14 @@ pub enum Ast {
     StartAnchor,
     /// `$`.
     EndAnchor,
+    /// `\b` — GNU word boundary (exactly one side is a word char).
+    WordBoundary,
+    /// `\B` — GNU non-boundary (both sides word, or neither).
+    NotWordBoundary,
+    /// `\<` — GNU start-of-word (next is word, previous is not).
+    WordStart,
+    /// `\>` — GNU end-of-word (previous is word, next is not).
+    WordEnd,
     /// A sequence of expressions matched one after another.
     Concat(Vec<Ast>),
     /// `a|b|...`.

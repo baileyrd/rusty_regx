@@ -33,6 +33,14 @@ pub enum Inst {
     StartAnchor,
     /// Assert end of input.
     EndAnchor,
+    /// Assert a GNU word boundary (exactly one adjacent char is a word char).
+    WordBoundary,
+    /// Assert a GNU non-boundary.
+    NotWordBoundary,
+    /// Assert start of word (`\<`).
+    WordStart,
+    /// Assert end of word (`\>`).
+    WordEnd,
     /// Try `first` then `second` (thread split; order encodes greediness).
     Split { first: usize, second: usize },
     /// Unconditional jump.
@@ -414,7 +422,11 @@ fn number(ast: &mut Ast, next_slot: &mut usize, tag_order: &mut Vec<usize>) {
         | Ast::AnyChar
         | Ast::Class(_)
         | Ast::StartAnchor
-        | Ast::EndAnchor => {}
+        | Ast::EndAnchor
+        | Ast::WordBoundary
+        | Ast::NotWordBoundary
+        | Ast::WordStart
+        | Ast::WordEnd => {}
         Ast::Concat(items) | Ast::Alternation(items) => {
             for item in items {
                 number(item, next_slot, tag_order);
@@ -441,7 +453,11 @@ fn max_group(ast: &Ast) -> u32 {
         | Ast::AnyChar
         | Ast::Class(_)
         | Ast::StartAnchor
-        | Ast::EndAnchor => 0,
+        | Ast::EndAnchor
+        | Ast::WordBoundary
+        | Ast::NotWordBoundary
+        | Ast::WordStart
+        | Ast::WordEnd => 0,
         Ast::Concat(items) | Ast::Alternation(items) => {
             items.iter().map(max_group).max().unwrap_or(0)
         }
@@ -510,6 +526,18 @@ impl Compiler {
             }
             Ast::EndAnchor => {
                 self.push(Inst::EndAnchor)?;
+            }
+            Ast::WordBoundary => {
+                self.push(Inst::WordBoundary)?;
+            }
+            Ast::NotWordBoundary => {
+                self.push(Inst::NotWordBoundary)?;
+            }
+            Ast::WordStart => {
+                self.push(Inst::WordStart)?;
+            }
+            Ast::WordEnd => {
+                self.push(Inst::WordEnd)?;
             }
             Ast::Concat(items) => {
                 for item in items {

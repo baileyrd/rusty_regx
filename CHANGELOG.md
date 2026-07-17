@@ -4,6 +4,23 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Breaking
+
+- GNU/glibc ERE extensions ([#18]): `\w` `\W` `\s` `\S` are word/space
+  classes, `\b` `\B` `\<` `\>` word assertions, `` \` `` `\'` input
+  anchors, and `{,n}` means `{0,n}` — matching what bash's glibc
+  `regcomp` does (each verified against bash 5.2; previously these were
+  literals or errors, silently diverging from bash). Quantifying an
+  assertion directly (`\b*`) is now an error, as in glibc. Other
+  escapes (`\d`) stay literal, as in glibc.
+- The bash-oracle differential generators now emit these constructs;
+  two hand-confirmed glibc submatch nonconformances are recorded in the
+  known-quirks list (group 0 always agrees).
+
+[#18]: https://github.com/baileyrd/rusty_regx/issues/18
+
 ## [0.3.0] — 2026-07-17
 
 ### Added
