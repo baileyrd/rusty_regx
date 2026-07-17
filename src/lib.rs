@@ -52,6 +52,14 @@ mod vm;
 
 pub use error::{Error, ErrorKind};
 
+std::thread_local! {
+    /// Reused by every one-shot call (`is_match`/`captures`/`find`) on
+    /// this thread, making them allocation-free after warmup. The VM
+    /// never calls user code, so the RefCell can't be re-entered.
+    static SCRATCH: std::cell::RefCell<vm::Scratch> =
+        std::cell::RefCell::new(vm::Scratch::default());
+}
+
 /// A compiled regular expression program.
 #[derive(Clone)]
 pub struct Regex {
@@ -228,7 +236,7 @@ impl Regex {
     /// # Ok::<(), rusty_regx::Error>(())
     /// ```
     pub fn is_match(&self, text: &str) -> bool {
-        vm::exec_bool(&self.program, text, 0, &mut vm::Scratch::default())
+        SCRATCH.with(|s| vm::exec_bool(&self.program, text, 0, &mut s.borrow_mut()))
     }
 
     /// Searches `text` for the leftmost match, returning the capture groups.
@@ -236,7 +244,7 @@ impl Regex {
     /// Group 0 is always the whole match. Groups that did not participate in
     /// the match report as absent via [`Captures::get`].
     pub fn captures<'t>(&self, text: &'t str) -> Option<Captures<'t>> {
-        self.captures_at(text, 0, &mut vm::Scratch::default())
+        SCRATCH.with(|s| self.captures_at(text, 0, &mut s.borrow_mut()))
     }
 
     fn captures_at<'t>(
@@ -331,7 +339,7 @@ impl Regex {
     /// # Ok::<(), rusty_regx::Error>(())
     /// ```
     pub fn find<'t>(&self, text: &'t str) -> Option<Match<'t>> {
-        self.find_at(text, 0, &mut vm::Scratch::default())
+        SCRATCH.with(|s| self.find_at(text, 0, &mut s.borrow_mut()))
     }
 
     /// The number of capture groups this pattern has, including group 0
@@ -433,6 +441,17 @@ impl<'t> Match<'t> {
     pub fn as_str(&self) -> &'t str {
         &self.text[self.start..self.end]
     }
+
+    /// The match's length in bytes.
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Whether this is a zero-width match (empty matches are legal and
+    /// handled specially by the iteration APIs).
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
 }
 
 /// The shared iteration step (the `regex` crate's rule): resume at the
@@ -472,6 +491,7 @@ fn iter_step(
 
 /// An iterator over all non-overlapping matches (see
 /// [`Regex::find_iter`]). VM working buffers are reused across matches.
+#[derive(Debug)]
 pub struct FindIter<'r, 't> {
     re: &'r Regex,
     text: &'t str,
@@ -501,6 +521,7 @@ impl<'t> Iterator for FindIter<'_, 't> {
 
 /// An iterator over all non-overlapping matches with full captures (see
 /// [`Regex::captures_iter`]).
+#[derive(Debug)]
 pub struct CapturesIter<'r, 't> {
     re: &'r Regex,
     text: &'t str,

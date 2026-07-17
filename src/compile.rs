@@ -161,6 +161,10 @@ pub struct Program {
     /// exclusion is checked by the VM), and `^`/`$` also match right
     /// after/before a `\n`.
     pub newline: bool,
+    /// When every match must start with a char of this class (index into
+    /// `classes`) and no literal prefix exists, the VM fast-forwards the
+    /// scan to the class's next member — `[0-9]+`, `\w+`-style heads.
+    pub first_class: Option<usize>,
 }
 
 /// A pattern that is a plain literal, matched by substring search.
@@ -246,6 +250,20 @@ pub fn compile(mut ast: Ast, icase: bool, newline: bool) -> Result<Program, Erro
     let suffix_anchored = ends_anchored(&ast) && !newline;
     // Groups need real capture tracking; the substring path reports only
     // group 0.
+    // Class-head scan hint: only when no literal prefix exists (the
+    // string prefix is the stronger hint) and the search is unanchored.
+    let first_class = if anchored || !prefix.is_empty() {
+        None
+    } else {
+        head_class(&ast)
+            .and_then(|cl| fold_class(&cl, icase).ok())
+            .map(|mut cl| {
+                normalize_ranges(&mut cl.ranges);
+                let index = c.classes.len();
+                c.classes.push(CompiledClass::new(cl));
+                index
+            })
+    };
     let literal = if icase || group_count > 1 {
         None
     } else {
@@ -265,6 +283,7 @@ pub fn compile(mut ast: Ast, icase: bool, newline: bool) -> Result<Program, Erro
         suffix,
         suffix_anchored,
         newline,
+        first_class,
     })
 }
 
@@ -274,6 +293,12 @@ pub fn compile(mut ast: Ast, icase: bool, newline: bool) -> Result<Program, Erro
 /// is the only capture. This is the common shape rush produces via
 /// `escape()` for `[[ $x =~ $literal ]]`.
 fn literal_of(ast: &Ast) -> Option<Literal> {
+    // An assertion constrains context without consuming — such a pattern
+    // is never *exactly* its literal, even though collect_prefix walks
+    // through assertions for scan-acceleration purposes.
+    if has_assertions(ast) {
+        return None;
+    }
     let single = std::slice::from_ref(ast);
     let mut items: &[Ast] = match ast {
         Ast::Concat(items) => items,
@@ -317,6 +342,49 @@ fn starts_anchored(ast: &Ast) -> bool {
     }
 }
 
+/// The class every match must start with, if the pattern's head is a
+/// mandatory class (the class analog of `collect_prefix`'s first char).
+/// Assertions are transparent; `min == 0` heads disqualify.
+fn head_class(ast: &Ast) -> Option<Class> {
+    match ast {
+        Ast::Class(c) => Some(c.clone()),
+        Ast::Concat(items) => {
+            for item in items {
+                match item {
+                    Ast::WordBoundary
+                    | Ast::NotWordBoundary
+                    | Ast::WordStart
+                    | Ast::WordEnd
+                    | Ast::Empty => continue,
+                    other => return head_class(other),
+                }
+            }
+            None
+        }
+        Ast::Group(_, inner) => head_class(inner),
+        Ast::Repeat { ast, min, .. } if *min >= 1 => head_class(ast),
+        Ast::Alternation(branches) => {
+            let c = head_class(branches.first()?)?;
+            branches
+                .iter()
+                .all(|b| head_class(b).as_ref() == Some(&c))
+                .then_some(c)
+        }
+        _ => None,
+    }
+}
+
+/// Whether the pattern contains any zero-width word assertion.
+fn has_assertions(ast: &Ast) -> bool {
+    match ast {
+        Ast::WordBoundary | Ast::NotWordBoundary | Ast::WordStart | Ast::WordEnd => true,
+        Ast::Concat(items) | Ast::Alternation(items) => items.iter().any(has_assertions),
+        Ast::Group(_, inner) => has_assertions(inner),
+        Ast::Repeat { ast, .. } => has_assertions(ast),
+        _ => false,
+    }
+}
+
 /// Accumulates the mandatory literal prefix of `ast` into `out` —
 /// the string every match must start with. Returns whether the walked
 /// construct is *exactly* its literal (so the prefix may keep growing
@@ -324,6 +392,17 @@ fn starts_anchored(ast: &Ast) -> bool {
 fn collect_prefix(ast: &Ast, out: &mut String) -> bool {
     match ast {
         Ast::Empty => true,
+        // Zero-width constructs consume nothing: the mandatory literal
+        // continues right through them (`\bword` and `^beta` — in line
+        // mode, where prefixes apply — must still start with their
+        // literal). The exact-literal path excludes assertions separately
+        // via `has_assertions`, and anchored patterns compute no prefix
+        // at all outside line mode.
+        Ast::WordBoundary
+        | Ast::NotWordBoundary
+        | Ast::WordStart
+        | Ast::WordEnd
+        | Ast::StartAnchor => true,
         Ast::Char(c) => {
             out.push(*c);
             true
@@ -387,6 +466,11 @@ fn ends_anchored(ast: &Ast) -> bool {
 fn collect_suffix_rev(ast: &Ast, out: &mut String) -> bool {
     match ast {
         Ast::Empty => true,
+        Ast::WordBoundary
+        | Ast::NotWordBoundary
+        | Ast::WordStart
+        | Ast::WordEnd
+        | Ast::EndAnchor => true,
         Ast::Char(c) => {
             out.push(*c);
             true
@@ -433,6 +517,18 @@ fn collect_suffix_rev(ast: &Ast, out: &mut String) -> bool {
 /// what makes POSIX mode prefer a longer repetition span over a "better"
 /// last iteration inside a shorter one.
 fn number(ast: &mut Ast, next_slot: &mut usize, tag_order: &mut Vec<usize>) {
+    // Canonicalize degenerate classes (`[a]`, `[[.a.]]`) to plain chars,
+    // unlocking the literal/prefix tiers and cheaper dispatch. Folding
+    // treats a one-char class and a char identically, so this is exact.
+    if let Ast::Class(class) = ast {
+        if !class.negated
+            && class.posix.is_empty()
+            && class.ranges.len() == 1
+            && class.ranges[0].0 == class.ranges[0].1
+        {
+            *ast = Ast::Char(class.ranges[0].0);
+        }
+    }
     match ast {
         Ast::Empty
         | Ast::Char(_)
@@ -585,40 +681,47 @@ impl Compiler {
         Ok(())
     }
 
-    /// In `icase` mode, folds a class the way glibc's `REG_ICASE` does:
-    /// range endpoints (including single characters, which are degenerate
-    /// ranges) fold to uppercase, and a range that is reversed *after*
-    /// folding is an error (`[Z-a]` is valid case-sensitively but folds to
-    /// `[Z-A]`; bash rejects it under `nocasematch`). `[[:upper:]]` and
-    /// `[[:lower:]]` both become `[[:alpha:]]` — glibc's documented
-    /// `REG_ICASE` rule, verified against bash 5.2.
+    /// See the free function [`fold_class`].
     fn fold_class(&self, class: &Class) -> Result<Class, Error> {
-        if !self.icase {
-            return Ok(class.clone());
-        }
-        let mut ranges = Vec::with_capacity(class.ranges.len());
-        for &(lo, hi) in &class.ranges {
-            let (lo, hi) = (fold(lo), fold(hi));
-            if lo > hi {
-                return Err(Error::new(ErrorKind::InvalidRange, None));
-            }
-            ranges.push((lo, hi));
-        }
-        let posix = class
-            .posix
-            .iter()
-            .map(|&p| match p {
-                PosixClass::Upper | PosixClass::Lower => PosixClass::Alpha,
-                p => p,
-            })
-            .collect();
-        Ok(Class {
-            negated: class.negated,
-            ranges,
-            posix,
-        })
+        fold_class(class, self.icase)
     }
+}
 
+/// In `icase` mode, folds a class the way glibc's `REG_ICASE` does:
+/// range endpoints (including single characters, which are degenerate
+/// ranges) fold to uppercase, and a range that is reversed *after*
+/// folding is an error (`[Z-a]` is valid case-sensitively but folds to
+/// `[Z-A]`; bash rejects it under `nocasematch`). `[[:upper:]]` and
+/// `[[:lower:]]` both become `[[:alpha:]]` — glibc's documented
+/// `REG_ICASE` rule, verified against bash 5.2.
+fn fold_class(class: &Class, icase: bool) -> Result<Class, Error> {
+    if !icase {
+        return Ok(class.clone());
+    }
+    let mut ranges = Vec::with_capacity(class.ranges.len());
+    for &(lo, hi) in &class.ranges {
+        let (lo, hi) = (fold(lo), fold(hi));
+        if lo > hi {
+            return Err(Error::new(ErrorKind::InvalidRange, None));
+        }
+        ranges.push((lo, hi));
+    }
+    let posix = class
+        .posix
+        .iter()
+        .map(|&p| match p {
+            PosixClass::Upper | PosixClass::Lower => PosixClass::Alpha,
+            p => p,
+        })
+        .collect();
+    Ok(Class {
+        negated: class.negated,
+        ranges,
+        posix,
+    })
+}
+
+impl Compiler {
     /// `b1|b2|…|bn`: a chain of splits, each preferring its branch (earlier
     /// branches win ties — leftmost-first).
     fn alternation(&mut self, branches: &[Ast]) -> Result<(), Error> {

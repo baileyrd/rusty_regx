@@ -690,6 +690,66 @@ fn debug_dump_shows_strategy() {
     assert!(dump.contains("+ newline"), "{dump}");
 }
 
+/// Round-5 scan hints: assertion-transparent prefixes, class-head
+/// fast-forward, degenerate-class canonicalization. Pins the regression
+/// the bool path had (carrying a stale \b verdict across a skip).
+#[test]
+fn scan_hints_preserve_semantics() {
+    let long = "pass word sword ".repeat(2_000);
+    // Assertion-transparent prefix: correct matches and — critically —
+    // correct *rejections* through is_match (the once-broken path).
+    let re = Regex::new(r"\bword\b").unwrap();
+    assert!(re.is_match(&long));
+    assert_eq!(re.find(&long).map(|m| (m.start(), m.end())), Some((5, 9)));
+    assert!(!re.is_match(&"password sword ".repeat(2_000)));
+    assert!(!Regex::new(r"\bword\b").unwrap().is_match("password"));
+    // Suffix through assertions still finds the real hit, not "sword"'s.
+    assert_eq!(
+        Regex::new(r"word\b")
+            .unwrap()
+            .find("swordfish word")
+            .map(|m| m.start()),
+        Some(10)
+    );
+    assert_eq!(
+        Regex::new(r"\<sword")
+            .unwrap()
+            .find(&long)
+            .map(|m| m.start()),
+        Some(10)
+    );
+    // Class-head fast-forward, all modes.
+    let digits = format!("{}42x", "xyz ".repeat(2_000));
+    for re in [
+        Regex::new("[0-9]+x").unwrap(),
+        Regex::new_posix("[0-9]+x").unwrap(),
+    ] {
+        assert_eq!(re.find(&digits).map(|m| m.as_str()), Some("42x"));
+        assert!(re.is_match(&digits));
+        assert!(!re.is_match(&"xyz ".repeat(2_000)));
+    }
+    // icase class head folds while scanning.
+    let re = Regex::new_ci("[a-f]+9").unwrap();
+    assert_eq!(
+        re.find(&format!("{}CAFE9", "XYZ ".repeat(1_000)))
+            .map(|m| m.as_str()),
+        Some("CAFE9")
+    );
+    // \w-headed patterns get the hint too (desugared class).
+    assert!(Regex::new(r"\w+=").unwrap().is_match("   key=1"));
+    // Canonicalized degenerate classes take the literal tier.
+    let dump = Regex::new("[a]bc").unwrap().debug_dump();
+    assert!(dump.contains("literal substring path"), "{dump}");
+    let dump = Regex::new("[[.a.]]bc").unwrap().debug_dump();
+    assert!(dump.contains("literal substring path"), "{dump}");
+    // Negated and multi-char classes are untouched.
+    assert!(Regex::new("[^a]").unwrap().is_match("b"));
+    assert!(!Regex::new("[^a]").unwrap().is_match("a"));
+    // \bword\b now reports a scan prefix in the dump.
+    let dump = Regex::new(r"\bword\b").unwrap().debug_dump();
+    assert!(dump.contains("scan prefix: \"word\""), "{dump}");
+}
+
 #[test]
 fn repetition_size_limits() {
     assert_eq!(

@@ -83,6 +83,46 @@ fn find_prefix(program: &Program, hay: &str) -> Option<usize> {
     None
 }
 
+/// Whether the program has any scan fast-forward hint.
+fn has_scan_hint(program: &Program) -> bool {
+    !program.prefix.is_empty() || program.first_class.is_some()
+}
+
+/// The next candidate match start in `hay`: the literal prefix's next
+/// occurrence, or — for class-headed patterns — the next char of the
+/// mandatory head class (ASCII via the bitmap on a byte loop; folded
+/// compare in `icase` mode).
+fn find_scan_hint(program: &Program, hay: &str) -> Option<usize> {
+    if !program.prefix.is_empty() {
+        return find_prefix(program, hay);
+    }
+    let class = &program.classes[program.first_class.expect("checked by has_scan_hint")];
+    if program.icase {
+        return hay
+            .char_indices()
+            .find(|&(_, c)| class.matches(fold(c)))
+            .map(|(i, _)| i);
+    }
+    let bytes = hay.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 128 {
+            if class.matches(b as char) {
+                return Some(i);
+            }
+            i += 1;
+        } else {
+            let c = hay[i..].chars().next().expect("boundary");
+            if class.matches(c) {
+                return Some(i);
+            }
+            i += c.len_utf8();
+        }
+    }
+    None
+}
+
 /// The mandatory-suffix quick reject: every match must end with
 /// `program.suffix`, so text that doesn't contain it (or doesn't end
 /// with it, for `\$`-anchored patterns) can't match — one substring
@@ -149,7 +189,7 @@ fn at_restart(clist: &[(usize, Slots)], restart: &[usize], pos: usize) -> bool {
 /// is amortized over all matches. Generations are monotonic within a
 /// `Scratch`, so stale visited/best stamps can never collide across
 /// reuses; thread lists are cleared at each entry.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Scratch {
     clist: Vec<(usize, Slots)>,
     nlist: Vec<(usize, Slots)>,
@@ -233,8 +273,8 @@ pub fn exec(
         // Fast-forward: when the pattern requires a literal prefix and no
         // live thread carries progress (see `at_restart`), nothing can
         // match before the prefix's next occurrence — skip straight to it.
-        if !program.prefix.is_empty() && matched.is_none() && at_restart(clist, &restart, pos) {
-            match find_prefix(program, &text[pos..]) {
+        if has_scan_hint(program) && matched.is_none() && at_restart(clist, &restart, pos) {
+            match find_scan_hint(program, &text[pos..]) {
                 Some(0) => {}
                 Some(off) => {
                     pos += off;
@@ -430,10 +470,29 @@ pub fn exec_bool(program: &Program, text: &str, from: usize, scratch: &mut Scrat
 
     let mut pos = from;
     loop {
-        if !program.prefix.is_empty() && *clist == restart {
-            match find_prefix(program, &text[pos..]) {
+        if has_scan_hint(program) && *clist == restart {
+            match find_scan_hint(program, &text[pos..]) {
                 Some(0) => {}
-                Some(off) => pos += off,
+                Some(off) => {
+                    pos += off;
+                    // Re-seed at the new position: with assertion-headed
+                    // patterns the spawn set is position-dependent (an
+                    // earlier position's \b verdict must not be carried).
+                    *gen += 1;
+                    clist.clear();
+                    add_thread_bool(
+                        program,
+                        clist,
+                        visited,
+                        *gen,
+                        stack,
+                        0,
+                        pos,
+                        len,
+                        text[..pos].chars().next_back(),
+                        text[pos..].chars().next(),
+                    );
+                }
                 None => return false,
             }
         }

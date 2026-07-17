@@ -99,6 +99,49 @@ fn main() {
         time(2_000, || theirs_word.captures(&text).is_some()),
     );
 
+    // Word-boundary pattern — the idiomatic GNU shape (the crate's \b is
+    // Unicode-aware but identical over ASCII).
+    let ours_wb = rusty_regx::Regex::new(r"\bword\b").unwrap();
+    let theirs_wb = regex::Regex::new(r"\bword\b").unwrap();
+    row(
+        r"is_match, \bword\b 96KB no-match",
+        time(20, || ours_wb.is_match(&text)),
+        time(20, || theirs_wb.is_match(&text)),
+    );
+
+    // Class-headed pattern where the suffix quick-reject can't help
+    // (every position has an 'x' nearby).
+    let ours_cls = rusty_regx::Regex::new("[0-9]+x").unwrap();
+    let theirs_cls = regex::Regex::new("[0-9]+x").unwrap();
+    row(
+        "is_match, [0-9]+x 96KB no-match",
+        time(20, || ours_cls.is_match(&text)),
+        time(20, || theirs_cls.is_match(&text)),
+    );
+
+    // Line-mode matching over many lines.
+    let lines: String = "alpha beta\n".repeat(4_000);
+    let ours_nl = rusty_regx::Regex::builder()
+        .newline(true)
+        .build("^beta")
+        .unwrap();
+    let theirs_nl = regex::Regex::new("(?m)^beta").unwrap();
+    row(
+        "is_match, ^beta line-mode 44KB",
+        time(200, || ours_nl.is_match(&lines)),
+        time(200, || theirs_nl.is_match(&lines)),
+    );
+
+    // Iteration throughput: count all numbers in a busy haystack.
+    let nums: String = "id 4217 x 99 :: 7 ".repeat(3_000);
+    let ours_it = rusty_regx::Regex::new("[0-9]+").unwrap();
+    let theirs_it = regex::Regex::new("[0-9]+").unwrap();
+    row(
+        "find_iter, count [0-9]+ in 54KB",
+        time(20, || ours_it.find_iter(&nums).count()),
+        time(20, || theirs_it.find_iter(&nums).count()),
+    );
+
     // Adversarial: catastrophic for backtrackers, must stay flat here.
     let a512 = "a".repeat(512);
     let ours = rusty_regx::Regex::new("(a+)+b").unwrap();
