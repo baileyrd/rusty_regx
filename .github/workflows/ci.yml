@@ -71,6 +71,10 @@ jobs:
           tool: cargo-audit
       - name: Audit main crate (dev-dependencies)
         run: cargo audit
+      # fuzz/Cargo.lock isn't committed (fuzz/.gitignore, standard for
+      # cargo-fuzz crates) — generate it fresh before auditing.
+      - name: Generate fuzz lockfile
+        run: cargo generate-lockfile --manifest-path fuzz/Cargo.toml
       - name: Audit fuzz crate
         run: cargo audit --file fuzz/Cargo.lock
 
