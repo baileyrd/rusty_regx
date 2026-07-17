@@ -34,49 +34,61 @@ const MAX_NESTING_DEPTH: u32 = 250;
 /// Parses an ERE pattern into an [`Ast`].
 pub fn parse(pattern: &str) -> Result<Ast, Error> {
     let mut parser = Parser {
-        chars: pattern.chars().collect(),
-        pos: 0,
+        pattern,
+        byte_pos: 0,
+        char_pos: 0,
         group_count: 0,
         depth: 0,
     };
     let ast = parser.alternation()?;
-    if parser.pos < parser.chars.len() {
+    if parser.byte_pos < pattern.len() {
         // alternation() only stops early on `)`.
         return Err(Error::new(
             ErrorKind::UnbalancedParenthesis,
-            Some(parser.pos),
+            Some(parser.char_pos),
         ));
     }
     Ok(ast)
 }
 
-struct Parser {
-    chars: Vec<char>,
-    pos: usize,
+/// Iterates the pattern `&str` directly — no up-front `Vec<char>`
+/// collection, keeping compilation allocation-light (compile speed is
+/// this engine's headline advantage; a shell pays it on every `=~`).
+/// `byte_pos` drives slicing; `char_pos` is carried alongside because
+/// error positions are documented as char offsets.
+struct Parser<'p> {
+    pattern: &'p str,
+    byte_pos: usize,
+    char_pos: usize,
     group_count: u32,
     depth: u32,
 }
 
-impl Parser {
+impl Parser<'_> {
+    fn rest(&self) -> &str {
+        &self.pattern[self.byte_pos..]
+    }
+
     fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+        self.rest().chars().next()
     }
 
     fn peek_at(&self, offset: usize) -> Option<char> {
-        self.chars.get(self.pos + offset).copied()
+        self.rest().chars().nth(offset)
     }
 
     fn bump(&mut self) -> Option<char> {
         let c = self.peek();
-        if c.is_some() {
-            self.pos += 1;
+        if let Some(c) = c {
+            self.byte_pos += c.len_utf8();
+            self.char_pos += 1;
         }
         c
     }
 
     fn eat(&mut self, c: char) -> bool {
         if self.peek() == Some(c) {
-            self.pos += 1;
+            self.bump();
             true
         } else {
             false
@@ -106,7 +118,7 @@ impl Parser {
                 Some('+') => self.quantify(&mut items, 1, None)?,
                 Some('?') => self.quantify(&mut items, 0, Some(1))?,
                 Some('{') => {
-                    let at = self.pos;
+                    let at = self.char_pos;
                     let (min, max) = self.interval()?;
                     let ast = items
                         .pop()
@@ -130,7 +142,7 @@ impl Parser {
 
     /// Applies `* + ?` (already peeked) to the preceding atom.
     fn quantify(&mut self, items: &mut Vec<Ast>, min: u32, max: Option<u32>) -> Result<(), Error> {
-        let at = self.pos;
+        let at = self.char_pos;
         self.bump();
         let ast = items
             .pop()
@@ -147,7 +159,7 @@ impl Parser {
     fn atom(&mut self) -> Result<Ast, Error> {
         match self.bump().expect("atom() called with input remaining") {
             '(' => {
-                let open = self.pos - 1;
+                let open = self.char_pos - 1;
                 self.depth += 1;
                 if self.depth > MAX_NESTING_DEPTH {
                     return Err(Error::new(ErrorKind::NestingTooDeep, Some(open)));
@@ -167,7 +179,10 @@ impl Parser {
             '$' => Ok(Ast::EndAnchor),
             '\\' => match self.bump() {
                 Some(c) => Ok(Ast::Char(c)),
-                None => Err(Error::new(ErrorKind::TrailingBackslash, Some(self.pos - 1))),
+                None => Err(Error::new(
+                    ErrorKind::TrailingBackslash,
+                    Some(self.char_pos - 1),
+                )),
             },
             c => Ok(Ast::Char(c)),
         }
@@ -175,7 +190,7 @@ impl Parser {
 
     /// Parses `{m}`, `{m,}`, or `{m,n}`; the leading `{` has been peeked.
     fn interval(&mut self) -> Result<(u32, Option<u32>), Error> {
-        let open = self.pos;
+        let open = self.char_pos;
         let err = || Error::new(ErrorKind::InvalidInterval, Some(open));
         self.bump();
         let min = self.integer(open)?;
@@ -198,25 +213,24 @@ impl Parser {
         Ok((min, Some(max)))
     }
 
-    /// `at` is the interval's `{`, where any failure is reported.
+    /// `at` is the interval's `{` (char offset), where any failure is
+    /// reported.
     fn integer(&mut self, at: usize) -> Result<u32, Error> {
-        let start = self.pos;
+        let start = self.byte_pos;
         while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            self.pos += 1;
+            self.bump();
         }
-        if self.pos == start {
+        if self.byte_pos == start {
             return Err(Error::new(ErrorKind::InvalidInterval, Some(at)));
         }
-        self.chars[start..self.pos]
-            .iter()
-            .collect::<String>()
+        self.pattern[start..self.byte_pos]
             .parse()
             .map_err(|_| Error::new(ErrorKind::InvalidInterval, Some(at)))
     }
 
     /// Parses a bracket expression; the leading `[` has been consumed.
     fn bracket(&mut self) -> Result<Ast, Error> {
-        let open = self.pos - 1;
+        let open = self.char_pos - 1;
         let negated = self.eat('^');
         let mut class = Class {
             negated,
@@ -241,7 +255,7 @@ impl Parser {
 
     /// One bracket item: a POSIX class, a range `a-z`, or a literal char.
     fn bracket_item(&mut self, class: &mut Class) -> Result<(), Error> {
-        let start = self.pos;
+        let start = self.char_pos;
         if self.peek() == Some('[') {
             match self.peek_at(1) {
                 Some(':') => {
@@ -277,19 +291,19 @@ impl Parser {
 
     /// Parses `[:name:]`; the leading `[` has been peeked (not consumed).
     fn posix_class(&mut self) -> Result<PosixClass, Error> {
-        let open = self.pos;
+        let open = self.char_pos;
         let err = || Error::new(ErrorKind::InvalidPosixClass, Some(open));
         self.bump(); // `[`
         self.bump(); // `:`
-        let start = self.pos;
+        let start = self.byte_pos;
         while self.peek().is_some_and(|c| c.is_ascii_lowercase()) {
-            self.pos += 1;
+            self.bump();
         }
-        let name: String = self.chars[start..self.pos].iter().collect();
+        let name = &self.pattern[start..self.byte_pos];
         if !(self.eat(':') && self.eat(']')) {
             return Err(err());
         }
-        match name.as_str() {
+        match name {
             "alnum" => Ok(PosixClass::Alnum),
             "alpha" => Ok(PosixClass::Alpha),
             "blank" => Ok(PosixClass::Blank),
