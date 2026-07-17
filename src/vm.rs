@@ -179,6 +179,100 @@ fn add_thread(
     }
 }
 
+/// Executes `program` against `text` as a pure boolean test.
+///
+/// No capture tracking: threads are bare program counters, so `Split`
+/// costs O(1) instead of cloning a slot vector. Match *existence* is
+/// identical across leftmost-first and POSIX semantics (both are "does
+/// any match exist?"), so this single path serves every mode.
+pub fn exec_bool(program: &Program, text: &str) -> bool {
+    let len = text.len();
+    let mut clist: Vec<usize> = Vec::new();
+    let mut nlist: Vec<usize> = Vec::new();
+    let mut visited = vec![false; program.insts.len()];
+    add_thread_bool(program, &mut clist, &mut visited, 0, 0, len);
+
+    let mut steps = text.char_indices();
+    loop {
+        let (pos, c) = match steps.next() {
+            Some((i, ch)) => (i, Some(ch)),
+            None => (len, None),
+        };
+        let next_pos = pos + c.map_or(0, char::len_utf8);
+        let fc = if program.icase { c.map(fold) } else { c };
+        visited.fill(false);
+        nlist.clear();
+        for pc in clist.drain(..) {
+            match &program.insts[pc] {
+                Inst::Char(x) => {
+                    if fc == Some(*x) {
+                        add_thread_bool(program, &mut nlist, &mut visited, pc + 1, next_pos, len);
+                    }
+                }
+                Inst::AnyChar => {
+                    if c.is_some() {
+                        add_thread_bool(program, &mut nlist, &mut visited, pc + 1, next_pos, len);
+                    }
+                }
+                Inst::Class(class) => {
+                    if fc.is_some_and(|ch| class_matches(class, ch)) {
+                        add_thread_bool(program, &mut nlist, &mut visited, pc + 1, next_pos, len);
+                    }
+                }
+                Inst::Match => return true,
+                Inst::Split { .. }
+                | Inst::Jump(_)
+                | Inst::Save(_)
+                | Inst::StartAnchor
+                | Inst::EndAnchor => unreachable!("epsilon inst in thread list"),
+            }
+        }
+        std::mem::swap(&mut clist, &mut nlist);
+        if c.is_none() || clist.is_empty() {
+            return false;
+        }
+    }
+}
+
+/// [`add_thread`] without slot tracking: `Save` becomes a no-op.
+fn add_thread_bool(
+    program: &Program,
+    list: &mut Vec<usize>,
+    visited: &mut [bool],
+    pc: usize,
+    pos: usize,
+    len: usize,
+) {
+    let mut stack = vec![pc];
+    while let Some(pc) = stack.pop() {
+        if visited[pc] {
+            continue;
+        }
+        visited[pc] = true;
+        match &program.insts[pc] {
+            Inst::Jump(target) => stack.push(*target),
+            Inst::Split { first, second } => {
+                stack.push(*second);
+                stack.push(*first);
+            }
+            Inst::Save(_) => stack.push(pc + 1),
+            Inst::StartAnchor => {
+                if pos == 0 {
+                    stack.push(pc + 1);
+                }
+            }
+            Inst::EndAnchor => {
+                if pos == len {
+                    stack.push(pc + 1);
+                }
+            }
+            Inst::Char(_) | Inst::AnyChar | Inst::Class(_) | Inst::Match => {
+                list.push(pc);
+            }
+        }
+    }
+}
+
 /// Executes `program` against `text` as an unanchored, leftmost-longest
 /// (POSIX) search — the v2 opt-in mode behind [`crate::Regex::new_posix`].
 ///

@@ -40,7 +40,7 @@ pub enum Inst {
 }
 
 /// A compiled program.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Program {
     pub insts: Vec<Inst>,
     /// Number of capture groups including group 0.

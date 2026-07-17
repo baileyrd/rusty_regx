@@ -53,7 +53,13 @@ fuzz_target!(|data: &[u8]| {
 /// Runs the match, exercises every group, checks the containment
 /// invariants, and returns group 0's byte span.
 fn span0(re: &Regex, text: &str) -> Option<(usize, usize)> {
-    let caps = re.captures(text)?;
+    let caps = re.captures(text);
+    assert_eq!(
+        re.is_match(text),
+        caps.is_some(),
+        "is_match disagrees with captures"
+    );
+    let caps = caps?;
     let g0 = caps.get(0).expect("group 0 must participate in a match");
     let start = g0.as_ptr() as usize - text.as_ptr() as usize;
     let end = start + g0.len();

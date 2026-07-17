@@ -50,7 +50,9 @@ if let Some(caps) = re.captures("release-2026") {
 }
 ```
 
-Matching is an unanchored search (like bash `=~`). `Regex::new` uses
+Matching is an unanchored search (like bash `=~`). When only match/no-match
+is needed, `is_match` skips capture tracking entirely and is faster than
+`captures`. `Regex::new` uses
 leftmost-first semantics, identical to the `regex` crate. `Regex::new_posix`
 opts into POSIX leftmost-longest semantics — what real bash/glibc report:
 
@@ -67,7 +69,7 @@ longest-alternative rule, which glibc itself deviates from in rare corners
 (~0.01% of randomly generated cases).
 
 `Regex::new_posix_ci` adds case-insensitive matching on top of the POSIX
-mode — POSIX `REG_ICASE`, which is what bash applies to `=~` under
+mode (`Regex::new_ci` is its leftmost-first counterpart) — POSIX `REG_ICASE`, which is what bash applies to `=~` under
 `shopt -s nocasematch`. Folding happens per character at comparison time
 (never in the captured text) and matches glibc exactly: literals and range
 endpoints fold, and `[[:upper:]]`/`[[:lower:]]` both behave as

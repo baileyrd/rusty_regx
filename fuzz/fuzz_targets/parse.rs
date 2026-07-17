@@ -9,6 +9,7 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     if let Ok(pattern) = std::str::from_utf8(data) {
         let _ = rusty_regx::Regex::new(pattern);
+        let _ = rusty_regx::Regex::new_ci(pattern);
         let _ = rusty_regx::Regex::new_posix(pattern);
         let _ = rusty_regx::Regex::new_posix_ci(pattern);
     }

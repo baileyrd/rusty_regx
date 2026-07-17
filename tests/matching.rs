@@ -162,6 +162,71 @@ fn rush_shaped_patterns() {
 }
 
 #[test]
+fn is_match_agrees_with_captures_in_every_mode() {
+    let cases = [
+        ("a|ab", "xab"),
+        ("^abc$", "ABC"),
+        ("(a+)+b", "aaaa"),
+        ("[[:digit:]]+", "abc123"),
+        ("", ""),
+        ("a", ""),
+        ("^$", "x"),
+        ("(a?)*", "b"),
+    ];
+    for (pattern, text) in cases {
+        for re in [
+            Regex::new(pattern).unwrap(),
+            Regex::new_posix(pattern).unwrap(),
+            Regex::new_ci(pattern).unwrap(),
+            Regex::new_posix_ci(pattern).unwrap(),
+        ] {
+            assert_eq!(
+                re.is_match(text),
+                re.captures(text).is_some(),
+                "is_match/captures disagree on pattern {pattern:?}, text {text:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn new_ci_is_leftmost_first_and_case_insensitive() {
+    let re = Regex::new_ci("a|ab").unwrap();
+    // Leftmost-first: the first alternative wins, unlike new_posix_ci.
+    assert_eq!(re.captures("AB").unwrap().get(0), Some("A"));
+    assert!(Regex::new_ci("^abc$").unwrap().is_match("ABC"));
+    // Captures keep the original case, same as the POSIX ci mode.
+    assert_eq!(
+        groups_of(&Regex::new_ci("^(a)(b)").unwrap(), "ABC"),
+        Some(vec![Some("AB".into()), Some("A".into()), Some("B".into())])
+    );
+    // Same folding rules as new_posix_ci.
+    assert!(Regex::new_ci("[X-Z]").unwrap().is_match("y"));
+    assert_eq!(Regex::new_ci("[Z-a]").unwrap_err(), Error::InvalidRange);
+}
+
+#[test]
+fn regex_reports_its_pattern() {
+    let re = Regex::new("a|b").unwrap();
+    assert_eq!(re.as_str(), "a|b");
+    assert_eq!(re.to_string(), "a|b");
+    assert_eq!(format!("{re:?}"), r#"Regex("a|b")"#);
+    // Clone produces an equivalent, independently usable regex.
+    let clone = re.clone();
+    assert_eq!(clone.as_str(), "a|b");
+    assert!(clone.is_match("xby"));
+}
+
+/// All groups via an already-compiled regex.
+fn groups_of(re: &Regex, text: &str) -> Option<Vec<Option<String>>> {
+    re.captures(text).map(|caps| {
+        (0..caps.len())
+            .map(|i| caps.get(i).map(str::to_owned))
+            .collect()
+    })
+}
+
+#[test]
 fn repetition_size_limits() {
     assert_eq!(
         Regex::new("a{1001}").unwrap_err(),

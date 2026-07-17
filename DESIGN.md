@@ -28,6 +28,8 @@ pub enum Error;              // structured parse errors, Display'd by rush
 
 impl Regex {
     pub fn new(pattern: &str) -> Result<Regex, Error>;
+    // Later additions: new_posix / new_ci / new_posix_ci (semantics modes),
+    // is_match (fast boolean path), as_str.
     pub fn captures<'t>(&self, text: &'t str) -> Option<Captures<'t>>;
 }
 impl<'t> Captures<'t> {
