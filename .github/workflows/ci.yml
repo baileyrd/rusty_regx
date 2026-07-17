@@ -63,8 +63,13 @@ jobs:
           tool: cargo-fuzz
       # A short smoke run per target on every change; real coverage comes
       # from longer local runs (`cargo +nightly fuzz run <target>`).
+      #
+      # --target is pinned to the gnu triple: the prebuilt cargo-fuzz
+      # binary is musl-linked and would otherwise default to the musl
+      # target, where ASan is incompatible with statically linked libc.
       - name: Fuzz each target briefly
         run: |
           for target in parse exec differential; do
-            cargo fuzz run "$target" -- -max_total_time=60 -max_len=512
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$target" -- \
+              -max_total_time=60 -max_len=512
           done
