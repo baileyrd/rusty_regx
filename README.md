@@ -10,9 +10,12 @@ it in drops five crates from rush's dependency tree.
 
 ## Status
 
-🚧 **Early scaffolding.** The public API and module layout are in place;
-the parser, compiler, and VM are being built per the
-[roadmap](DESIGN.md#roadmap).
+✅ **Engine complete.** The parser, compiler, and Pike VM are implemented,
+including the POSIX leftmost-longest mode (`Regex::new_posix`) and the
+case-insensitive mode (`Regex::new_posix_ci`), and validated by a
+differential harness against the `regex` crate and a live bash oracle.
+The remaining [roadmap](DESIGN.md#roadmap) item is the rush integration
+itself (step 4).
 
 ## Scope
 

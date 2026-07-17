@@ -16,8 +16,11 @@
 //!
 //! - Matching is an *unanchored search* (like bash `=~`), implemented via an
 //!   implicit non-greedy prefix.
-//! - v1 uses leftmost-first (Perl-style) match semantics, identical to the
-//!   `regex` crate. POSIX leftmost-longest is planned as a v2 opt-in mode.
+//! - [`Regex::new`] uses leftmost-first (Perl-style) match semantics,
+//!   identical to the `regex` crate. [`Regex::new_posix`] opts into POSIX
+//!   leftmost-longest semantics — what real bash/glibc report — and
+//!   [`Regex::new_posix_ci`] adds case-insensitive matching on top
+//!   (`REG_ICASE`, bash's `shopt -s nocasematch`).
 //!
 //! # Example
 //!
