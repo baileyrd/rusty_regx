@@ -248,6 +248,73 @@ fn groups_of(re: &Regex, text: &str) -> Option<Vec<Option<String>>> {
     })
 }
 
+/// The anchored fast path and literal-prefix fast-forward are pure
+/// optimizations — these pin the cases where a buggy version would
+/// change results (threads that loop back to the pattern head, captures
+/// recorded across skipped regions, mixed anchored/unanchored branches).
+#[test]
+fn scan_optimizations_preserve_semantics() {
+    // Anchored: no unanchored prefix is compiled.
+    assert_eq!(find("^a", "xxa"), None);
+    assert_eq!(find("^a|^b", "zab"), None);
+    assert_eq!(find("(^a)(b)", "ab"), Some("ab"));
+    assert_eq!(find("^(a|b)+c$", "bac"), Some("bac"));
+    // Mixed branches are NOT anchored: the unanchored one must still search.
+    assert_eq!(find("^a|b", "zzb"), Some("b"));
+    // (^a)?b matches b anywhere — a min-0 head never anchors.
+    assert_eq!(find("(^a)?b", "zzb"), Some("b"));
+
+    // Literal-prefix fast-forward: matches after long skippable gaps,
+    // with captures reporting the right (post-skip) offsets.
+    let text = format!("{}ab-12", ".".repeat(1000).replace('.', "x"));
+    assert_eq!(
+        groups("(a)(b)-([0-9]+)", &text),
+        Some(vec![
+            Some("ab-12".into()),
+            Some("a".into()),
+            Some("b".into()),
+            Some("12".into())
+        ])
+    );
+    // Loop-back-to-head shapes: a thread mid-iteration must never be
+    // mistaken for a fresh restart state.
+    assert_eq!(find("(ab)+c", "ab abababc"), Some("abababc"));
+    assert_eq!(find("a+b", "aaa aab"), Some("aab"));
+    assert_eq!(
+        groups("(a+)(b)", "aa aaab"),
+        Some(vec![
+            Some("aaab".into()),
+            Some("aaa".into()),
+            Some("b".into())
+        ])
+    );
+    // The required char never recurs: must report no match, quickly.
+    assert_eq!(find("ab", "zzzzzz"), None);
+    // POSIX mode takes the same paths.
+    assert_eq!(find_posix("(ab)+c", "ab abababc"), Some("abababc"));
+    assert_eq!(find_posix("^a|^b", "zab"), None);
+    assert_eq!(
+        groups_posix("(a+)(b)", "aa aaab"),
+        Some(vec![
+            Some("aaab".into()),
+            Some("aaa".into()),
+            Some("b".into())
+        ])
+    );
+    // And is_match agrees everywhere.
+    for (p, t) in [
+        ("^a", "xxa"),
+        ("(ab)+c", "ab abababc"),
+        ("a+b", "aaa aab"),
+        ("ab", "zzzzzz"),
+        ("^a|b", "zzb"),
+    ] {
+        for re in [Regex::new(p).unwrap(), Regex::new_posix(p).unwrap()] {
+            assert_eq!(re.is_match(t), re.captures(t).is_some(), "{p} on {t}");
+        }
+    }
+}
+
 #[test]
 fn repetition_size_limits() {
     assert_eq!(
