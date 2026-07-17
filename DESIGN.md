@@ -120,3 +120,24 @@ Other decisions:
    report the original, unfolded input spans.)*
 
 Estimated size: ~1.5–2.5k lines of engine + a comparable test volume.
+
+## Current state and direction (post-roadmap)
+
+The numbered roadmap above completed at v0.1; everything since is
+tracked in [RELEASE_NOTES.md](RELEASE_NOTES.md) /
+[CHANGELOG.md](CHANGELOG.md). Highlights beyond the original plan:
+
+- The five-tier execution strategy described under Architecture
+  (literal substring path → suffix quick reject → anchored fast path →
+  prefix/class fast-forward → Pike VM).
+- GNU/glibc extensions (`\w` `\s` `\b` `\<` …), degenerate collating
+  forms, `REG_NEWLINE` line mode via `Regex::builder()` — each
+  verified against bash 5.2 and pinned by the differential oracles
+  (six suites, ~48k comparisons per run).
+- The iteration API (`find_iter`/`captures_iter`), `find`,
+  `debug_dump`, and the docs set (`docs/FLAVORS.md`,
+  `docs/COOKBOOK.md`).
+
+Open direction: running shell globs and extglob on this same engine —
+see [docs/GLOB_DESIGN.md](docs/GLOB_DESIGN.md) (issue #20), which
+would close the last backtracking matcher in rush.

@@ -4,6 +4,31 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `examples/grep.rs`; `Match::len`/`is_empty`; `Debug` for the iterator
+  types; a REG_NEWLINE differential oracle vs the crate's `(?m)`;
+  mode-randomized fuzzing with `find_iter` invariants; GitHub Release
+  automation on tag push (body extracted from RELEASE_NOTES.md).
+
+### Performance
+
+- Scan hints now see through zero-width constructs (`\bword\b`:
+  2.6ms → 3.1µs on a 96KB no-match — parity with the regex crate);
+  class-headed patterns (`[0-9]+`, `\w+`) fast-forward via the ASCII
+  class bitmaps (~40×); one-shot calls share a thread-local scratch
+  (allocation-free after warmup); degenerate classes (`[a]`) compile to
+  plain chars.
+
+### Fixed
+
+- `is_match` (only) could report a false match for assertion-headed
+  patterns when the scan fast-forward skipped: the boolean path carried
+  a thread list embedding the old position's `\b` verdict. It now
+  re-seeds after every skip, like the capture paths.
+
 ## [0.4.0] — 2026-07-17
 
 ### Breaking
