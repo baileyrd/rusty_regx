@@ -30,6 +30,10 @@ jobs:
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      # Proves the crate packages for crates.io (manifest, file list,
+      # readme path) without the slow verify build.
+      - name: Package check
+        run: cargo package --no-verify
 
   # The declared MSRV (Cargo.toml rust-version) is a promise; the code even
   # carries manual workarounds for it (map_or over is_none_or in vm.rs).

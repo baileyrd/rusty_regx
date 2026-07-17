@@ -4,42 +4,46 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.1.0] — 2026-07-17
 
-### Added
+First tagged release: the complete engine, integrated as the `[[ =~ ]]`
+backend of [`rush`](https://github.com/baileyrd/rush).
 
-- `Regex::is_match`: boolean matching without capture tracking — faster
-  than `captures`, one shared fast path across all modes.
-- `Regex::new_ci`: leftmost-first case-insensitive mode, completing the
-  `{leftmost-first, POSIX} × {sensitive, insensitive}` constructor matrix.
-- `Regex::as_str`, `Display`, `Clone`, and a `Debug` impl that shows the
-  pattern instead of compiled bytecode.
-- `Error::position()`: parse errors now report the 0-based char offset of
-  the offending construct; `Display` appends `at position N`.
-  `Error::kind()` (the new `ErrorKind` enum) carries what went wrong.
-- Fuzz targets (`fuzz/`): parse robustness, exec robustness with
-  cross-mode invariants, and boolean differential against the `regex`
-  crate; CI runs a smoke pass per change.
-- Benchmarks against the `regex` crate (`cargo bench`).
-- CI verifies the declared MSRV (1.75).
+### Engine
 
-### Changed
+- POSIX-ERE parser (full grammar including bracket corner cases),
+  bytecode compiler, and Pike VM with captures — linear-time, zero
+  dependencies, no `unsafe`.
+- POSIX leftmost-longest mode (`Regex::new_posix`) and case-insensitive
+  `REG_ICASE` modes (`Regex::new_posix_ci`, `Regex::new_ci`), verified
+  differentially against the `regex` crate and live bash 5.2 oracles.
+- Group-nesting depth cap (250): deeply nested user patterns report
+  `ErrorKind::NestingTooDeep` instead of overflowing the stack.
 
-- `Error` is now a struct (`kind()` + `position()`) instead of a bare
-  enum; match on `ErrorKind` instead of `Error` variants.
-- Pike VM capture slots are copy-on-write; measured ~17% faster
-  leftmost-first captures, ~34% faster POSIX captures, and ~62% faster
-  boolean matching on full-scan workloads.
+### API
 
-### Fixed
+- `Regex::is_match` (capture-free fast path), `captures`, `as_str`,
+  `Display`, `Clone`; `escape()` returns `Cow<str>`, borrowing input
+  with no metacharacters.
+- `Captures::get` / `span` (byte offsets) / `iter` / `len` and
+  `Index<usize>`.
+- Structured errors: `Error::kind()` (`ErrorKind`) plus
+  `Error::position()` — the 0-based char offset of the offending
+  construct; `Display` appends `at position N`.
 
-- A pattern with very deeply nested groups (e.g. hundreds of thousands of
-  open parens) overflowed the parser's stack and aborted the process.
-  Nesting is now capped at 250 levels (`ErrorKind::NestingTooDeep`).
+### Performance
 
-## [0.1.0] — unreleased scaffold
+- Start-anchored patterns skip the unanchored scan prefix entirely
+  (`^`-anchored no-match on 96KB: ~11ms → 123ns).
+- Scans with a mandatory literal first char fast-forward via substring
+  search (~17× on literal-headed scans).
+- Copy-on-write capture slots; interned, range-normalized classes with
+  binary-search membership; allocation-light `&str` parsing.
 
-Initial engine: POSIX-ERE parser, bytecode compiler, Pike VM with
-captures, POSIX leftmost-longest mode (`new_posix`), case-insensitive
-mode (`new_posix_ci`), `escape()`, and the differential harness against
-the `regex` crate and a live bash oracle.
+### Tooling
+
+- Differential harness (2000 random cases × 4 oracles), fuzz targets
+  (parse / exec invariants / regex-crate differential) with a seeded CI
+  smoke job and a weekly unseeded deep-fuzz workflow, benchmarks vs the
+  `regex` crate, MSRV (1.75) verification, and a crates.io package
+  check in CI.
