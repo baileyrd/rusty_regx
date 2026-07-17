@@ -60,6 +60,18 @@ pub enum ErrorKind {
     NestingTooDeep,
     /// An interval expansion exceeds the program-size cap.
     RepetitionTooLarge,
+    /// A `(?...)` construct that isn't one of the supported forms:
+    /// `(?:...)` (non-capturing group), `(?=...)`/`(?!...)` (lookahead),
+    /// `(?<=...)`/`(?<!...)` (lookbehind).
+    InvalidGroupSyntax,
+    /// A lookbehind (`(?<=...)`/`(?<!...)`) whose body doesn't match a
+    /// single fixed number of characters — e.g. it contains `*`, `+`, an
+    /// open-ended `{m,}`, or an alternation between branches of different
+    /// lengths. Only fixed-length lookbehind is supported (matching older
+    /// PCRE/Perl behavior), since variable-length lookbehind requires
+    /// either backtracking or reverse-matching machinery this engine
+    /// doesn't have; see `docs/LOOKAROUND.md`.
+    VariableLengthLookbehind,
 }
 
 impl fmt::Display for Error {
@@ -76,6 +88,12 @@ impl fmt::Display for Error {
             ErrorKind::TrailingBackslash => "pattern ends with a trailing backslash",
             ErrorKind::NestingTooDeep => "expression is nested too deeply",
             ErrorKind::RepetitionTooLarge => "repetition interval is too large",
+            ErrorKind::InvalidGroupSyntax => {
+                "unrecognized (?...) construct (expected (?: (?= (?! (?<= or (?<!)"
+            }
+            ErrorKind::VariableLengthLookbehind => {
+                "lookbehind body must match a fixed number of characters"
+            }
         };
         match self.pos {
             Some(pos) => write!(f, "{msg} at position {pos}"),

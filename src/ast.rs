@@ -46,6 +46,20 @@ pub enum Ast {
         /// compiler assigns real slots in a numbering pass.
         slot: usize,
     },
+    /// A Perl-style lookaround assertion: `(?=...)`/`(?!...)` (lookahead) or
+    /// `(?<=...)`/`(?<!...)` (lookbehind). Zero-width: constrains context
+    /// without consuming input, like the word assertions. Groups inside
+    /// `inner` do not capture (the parser unwraps `( )` to plain grouping
+    /// there) — see `docs/LOOKAROUND.md` for the full semantics and the
+    /// fixed-length restriction on lookbehind.
+    Lookaround {
+        /// `true` for lookahead (`(?= (?!`), `false` for lookbehind
+        /// (`(?<= (?<!`).
+        ahead: bool,
+        /// `true` for the negated forms (`(?!` / `(?<!`).
+        negative: bool,
+        inner: Box<Ast>,
+    },
 }
 
 /// A bracket expression: a (possibly negated) set of codepoint ranges and

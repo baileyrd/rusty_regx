@@ -59,6 +59,36 @@ pub enum Inst {
     Save(usize),
     /// Successful match.
     Match,
+    /// Perl-style lookahead assertion `(?=...)`/`(?!...)`: at the current
+    /// position, run `Program::lookarounds[i]`'s sub-program anchored
+    /// right here (not a search — it must match starting exactly at this
+    /// position) and continue only if it matches (or doesn't, for the
+    /// negative form — see `LookaroundProg::negative`). Zero-width.
+    Lookahead(usize),
+    /// Perl-style lookbehind assertion `(?<=...)`/`(?<!...)`: as
+    /// `Lookahead`, but the sub-program is checked ending exactly at the
+    /// current position (`LookaroundProg::len` chars back — lookbehind is
+    /// only supported at fixed length; see `docs/LOOKAROUND.md`).
+    /// Zero-width.
+    Lookbehind(usize),
+}
+
+/// A compiled lookaround sub-pattern, referenced by `Inst::Lookahead`/
+/// `Inst::Lookbehind`. Always a single-group (no captures — lookaround
+/// bodies can't capture, see `Ast::Lookaround`), boolean-only program:
+/// the VM only ever asks "does this match right here", never for a span.
+#[derive(Debug, Clone)]
+pub struct LookaroundProg {
+    /// `true` for `(?=`/`(?!` (lookahead), `false` for `(?<=`/`(?<!`
+    /// (lookbehind).
+    pub ahead: bool,
+    /// `true` for the negated forms (`(?!`/`(?<!`).
+    pub negative: bool,
+    /// For lookbehind only: the exact number of chars the body consumes
+    /// (validated fixed-length at parse time — see
+    /// [`crate::compile::fixed_len`]). Unused (0) for lookahead.
+    pub len: usize,
+    pub program: Program,
 }
 
 /// A compiled bracket expression: ASCII membership precomputed as a
@@ -177,6 +207,9 @@ pub struct Program {
     /// `classes`) and no literal prefix exists, the VM fast-forwards the
     /// scan to the class's next member — `[0-9]+`, `\w+`-style heads.
     pub first_class: Option<usize>,
+    /// Compiled lookaround sub-programs, referenced by `Inst::Lookahead`/
+    /// `Inst::Lookbehind` index. Empty for patterns with no lookaround.
+    pub lookarounds: Vec<LookaroundProg>,
 }
 
 /// A pattern that is a plain literal, matched by substring search.
@@ -228,7 +261,22 @@ pub fn fold(c: char) -> char {
 /// `=~` semantics. Anchored programs omit the prefix entirely: their
 /// thread list empties as soon as position 0 fails, so `^b` against a
 /// megabyte of text stops after one character instead of scanning it all.
-pub fn compile(mut ast: Ast, icase: bool, newline: bool) -> Result<Program, Error> {
+pub fn compile(ast: Ast, icase: bool, newline: bool) -> Result<Program, Error> {
+    compile_impl(ast, icase, newline, false)
+}
+
+/// As [`compile`], but when `force_anchored` is set, the program is always
+/// compiled as if start-anchored — no unanchored-search prefix — so it
+/// only ever matches starting exactly at the position it's invoked from.
+/// Used for lookaround sub-programs: `(?=foo)` means "does `foo` match
+/// right here", not "does `foo` occur somewhere ahead" (which is what an
+/// ordinary unanchored search would check).
+fn compile_impl(
+    mut ast: Ast,
+    icase: bool,
+    newline: bool,
+    force_anchored: bool,
+) -> Result<Program, Error> {
     let group_count = max_group(&ast) as usize + 1;
     let mut tag_order = vec![0];
     let mut next_slot = 2 * group_count;
@@ -237,10 +285,11 @@ pub fn compile(mut ast: Ast, icase: bool, newline: bool) -> Result<Program, Erro
     // Under REG_NEWLINE, `^` matches after any newline, so the
     // anchored-at-0 fast path doesn't apply — but `` \` `` still does,
     // since it always means true position 0 regardless of mode.
-    let anchored = starts_anchored(&ast, newline);
+    let anchored = force_anchored || starts_anchored(&ast, newline);
     let mut c = Compiler {
         insts: Vec::new(),
         classes: Vec::new(),
+        lookarounds: Vec::new(),
         icase,
         newline,
     };
@@ -267,12 +316,27 @@ pub fn compile(mut ast: Ast, icase: bool, newline: bool) -> Result<Program, Erro
         }
     }
     let mut suffix = String::new();
-    collect_suffix_rev(&ast, &mut suffix);
-    suffix = suffix.chars().rev().collect();
-    if icase {
-        // The VM compares folded chars; pre-fold the needle to match (same
-        // reasoning as the prefix, just at the tail).
-        suffix = suffix.chars().map(fold).collect();
+    if !force_anchored {
+        // The suffix quick-reject scans from `from` to the *end of the
+        // whole haystack* looking for the suffix — a good trade once per
+        // top-level search, but catastrophic for a lookaround
+        // sub-program, which gets invoked at every candidate position in
+        // the outer scan: a suffix that never occurs would make each of
+        // those thousands of checks re-scan the entire remaining
+        // haystack (O(n) per check, O(n^2) total for a full scan) for a
+        // "does this occur anywhere ahead" answer that a `force_anchored`
+        // program has no use for — it only ever checks one exact
+        // position. This was a real bug caught by benchmarking:
+        // `a(?=bcd)` against a 96KB haystack containing no "bcd" took
+        // roughly 1 second per call before this gate, vs single-digit
+        // milliseconds after.
+        collect_suffix_rev(&ast, &mut suffix);
+        suffix = suffix.chars().rev().collect();
+        if icase {
+            // The VM compares folded chars; pre-fold the needle to match
+            // (same reasoning as the prefix, just at the tail).
+            suffix = suffix.chars().map(fold).collect();
+        }
     }
     // Under REG_NEWLINE, `$` also matches before a newline, so the suffix
     // may sit anywhere — keep the contains() check only. `\'` is unaffected.
@@ -293,7 +357,16 @@ pub fn compile(mut ast: Ast, icase: bool, newline: bool) -> Result<Program, Erro
                 index
             })
     };
-    let literal = if group_count > 1 {
+    let literal = if group_count > 1 || force_anchored {
+        // The substring path only ever checks "true position 0" or
+        // "unanchored search from `from`" (see `literal_span`) — neither
+        // matches what a lookaround sub-program needs ("matches starting
+        // exactly at the arbitrary `from` it's invoked at"), so it's
+        // simply not used here; the VM handles it correctly instead. This
+        // was a real bug caught by testing: `(?=bar)` against "xbar"
+        // incorrectly held at position 0, because the unanchored literal
+        // search for "bar" found it at position 1 — "somewhere ahead",
+        // not "right here".
         None
     } else {
         // The substring path always checks true position 0 / true end of
@@ -329,7 +402,45 @@ pub fn compile(mut ast: Ast, icase: bool, newline: bool) -> Result<Program, Erro
         suffix_anchored,
         newline,
         first_class,
+        lookarounds: c.lookarounds,
     })
+}
+
+/// The exact number of chars every match of `ast` consumes, if constant —
+/// `None` for variable length (an open-ended repeat, or an alternation
+/// between differently-sized branches). Used to validate lookbehind
+/// bodies (`(?<=...)`/`(?<!...)`), which this engine only supports at
+/// fixed length: unlike lookahead, checking a variable-length lookbehind
+/// would mean trying every possible start position backward (or a
+/// reverse-matching VM this engine doesn't have), which is both slower
+/// and a materially different feature — see `docs/LOOKAROUND.md`.
+pub(crate) fn fixed_len(ast: &Ast) -> Option<usize> {
+    match ast {
+        Ast::Empty
+        | Ast::StartAnchor
+        | Ast::EndAnchor
+        | Ast::BufferStart
+        | Ast::BufferEnd
+        | Ast::WordBoundary
+        | Ast::NotWordBoundary
+        | Ast::WordStart
+        | Ast::WordEnd
+        | Ast::Lookaround { .. } => Some(0),
+        Ast::Char(_) | Ast::AnyChar | Ast::Class(_) => Some(1),
+        Ast::Concat(items) => items
+            .iter()
+            .try_fold(0usize, |acc, i| Some(acc + fixed_len(i)?)),
+        Ast::Alternation(branches) => {
+            let mut lens = branches.iter().map(fixed_len);
+            let first = lens.next()??;
+            lens.all(|l| l == Some(first)).then_some(first)
+        }
+        Ast::Group(_, inner) => fixed_len(inner),
+        Ast::Repeat { ast, min, max, .. } => {
+            let body = fixed_len(ast)?;
+            (*max == Some(*min)).then(|| body * *min as usize)
+        }
+    }
 }
 
 /// If the whole pattern is a plain literal — `Char`s only, optionally
@@ -423,6 +534,7 @@ fn head_class(ast: &Ast) -> Option<Class> {
                     | Ast::NotWordBoundary
                     | Ast::WordStart
                     | Ast::WordEnd
+                    | Ast::Lookaround { .. }
                     | Ast::Empty => continue,
                     other => return head_class(other),
                 }
@@ -442,10 +554,17 @@ fn head_class(ast: &Ast) -> Option<Class> {
     }
 }
 
-/// Whether the pattern contains any zero-width word assertion.
+/// Whether the pattern contains any zero-width assertion (word assertion
+/// or lookaround) — such a pattern is never *exactly* its literal text,
+/// even though it may still be a plain literal for prefix/suffix
+/// acceleration purposes (see `collect_prefix`).
 fn has_assertions(ast: &Ast) -> bool {
     match ast {
-        Ast::WordBoundary | Ast::NotWordBoundary | Ast::WordStart | Ast::WordEnd => true,
+        Ast::WordBoundary
+        | Ast::NotWordBoundary
+        | Ast::WordStart
+        | Ast::WordEnd
+        | Ast::Lookaround { .. } => true,
         Ast::Concat(items) | Ast::Alternation(items) => items.iter().any(has_assertions),
         Ast::Group(_, inner) => has_assertions(inner),
         Ast::Repeat { ast, .. } => has_assertions(ast),
@@ -471,7 +590,8 @@ fn collect_prefix(ast: &Ast, out: &mut String) -> bool {
         | Ast::WordStart
         | Ast::WordEnd
         | Ast::StartAnchor
-        | Ast::BufferStart => true,
+        | Ast::BufferStart
+        | Ast::Lookaround { .. } => true,
         Ast::Char(c) => {
             out.push(*c);
             true
@@ -541,7 +661,8 @@ fn collect_suffix_rev(ast: &Ast, out: &mut String) -> bool {
         | Ast::WordStart
         | Ast::WordEnd
         | Ast::EndAnchor
-        | Ast::BufferEnd => true,
+        | Ast::BufferEnd
+        | Ast::Lookaround { .. } => true,
         Ast::Char(c) => {
             out.push(*c);
             true
@@ -613,6 +734,13 @@ fn number(ast: &mut Ast, next_slot: &mut usize, tag_order: &mut Vec<usize>) {
         | Ast::NotWordBoundary
         | Ast::WordStart
         | Ast::WordEnd => {}
+        // Opaque here: a lookaround body can't capture (no `Group` nodes
+        // are possible inside one — the parser strips them, see
+        // `Ast::Lookaround`), and it gets its own independent numbering
+        // pass when compiled as a nested sub-program (`emit`'s
+        // `Lookaround` arm), so recursing into it here would only waste
+        // slots the outer program never uses.
+        Ast::Lookaround { .. } => {}
         Ast::Concat(items) | Ast::Alternation(items) => {
             for item in items {
                 number(item, next_slot, tag_order);
@@ -645,7 +773,9 @@ fn max_group(ast: &Ast) -> u32 {
         | Ast::WordBoundary
         | Ast::NotWordBoundary
         | Ast::WordStart
-        | Ast::WordEnd => 0,
+        | Ast::WordEnd
+        // Always 0: no `Group` nodes are possible inside a lookaround body.
+        | Ast::Lookaround { .. } => 0,
         Ast::Concat(items) | Ast::Alternation(items) => {
             items.iter().map(max_group).max().unwrap_or(0)
         }
@@ -657,6 +787,7 @@ fn max_group(ast: &Ast) -> u32 {
 struct Compiler {
     insts: Vec<Inst>,
     classes: Vec<CompiledClass>,
+    lookarounds: Vec<LookaroundProg>,
     icase: bool,
     newline: bool,
 }
@@ -758,6 +889,36 @@ impl Compiler {
                 max,
                 slot,
             } => self.repeat(ast, *min, *max, *slot)?,
+            Ast::Lookaround {
+                ahead,
+                negative,
+                inner,
+            } => {
+                // A fresh, independently-numbered sub-program: see
+                // `compile_impl`'s `force_anchored` — it must check "does
+                // this match right here", never search ahead. Lookbehind's
+                // fixed length is a parser-time invariant (`special_group`
+                // rejects variable-length bodies), so the `expect` here
+                // can't fail for any `Ast` the parser produces.
+                let sub = compile_impl((**inner).clone(), self.icase, self.newline, true)?;
+                let len = if *ahead {
+                    0
+                } else {
+                    fixed_len(inner).expect("parser rejects variable-length lookbehind")
+                };
+                let index = self.lookarounds.len();
+                self.lookarounds.push(LookaroundProg {
+                    ahead: *ahead,
+                    negative: *negative,
+                    len,
+                    program: sub,
+                });
+                self.push(if *ahead {
+                    Inst::Lookahead(index)
+                } else {
+                    Inst::Lookbehind(index)
+                })?;
+            }
         }
         Ok(())
     }

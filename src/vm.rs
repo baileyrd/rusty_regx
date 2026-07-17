@@ -22,7 +22,7 @@
 //! group in index order — the classic leftmost-longest approximation used
 //! by RE2's POSIX mode, matching what bash/glibc report.
 
-use crate::compile::{fold, Inst, Literal, Program};
+use crate::compile::{fold, Inst, Literal, LookaroundProg, Program};
 use std::rc::Rc;
 
 /// Byte offsets recorded by `Save`; two slots per group.
@@ -158,6 +158,40 @@ fn find_scan_hint(program: &Program, hay: &str) -> Option<usize> {
     None
 }
 
+/// The byte offset exactly `n` chars before `pos` in `text`, or `None` if
+/// fewer than `n` chars precede `pos`. Used by lookbehind, which this
+/// engine only supports at fixed length (`n` = `LookaroundProg::len`).
+fn nth_char_boundary_back(text: &str, pos: usize, n: usize) -> Option<usize> {
+    let mut offset = pos;
+    for _ in 0..n {
+        offset -= text[..offset].chars().next_back()?.len_utf8();
+    }
+    Some(offset)
+}
+
+/// Whether a lookaround assertion (`Inst::Lookahead`/`Inst::Lookbehind`)
+/// is satisfied at `pos`, accounting for negation. Runs the sub-program as
+/// a plain boolean check: lookahead anchored at `pos` itself; lookbehind
+/// anchored `len` chars back (checked fixed-length at parse time — an
+/// insufficient number of preceding chars simply means the body can't
+/// match, same as any other failed match). A fresh `Scratch` is allocated
+/// per check — no thread-local reuse — since lookaround is a nested,
+/// potentially-recursive sub-match with its own independent VM state; see
+/// `docs/LOOKAROUND.md` for the performance discussion this is meant to
+/// let the benchmarks surface.
+fn lookaround_holds(la: &LookaroundProg, text: &str, pos: usize) -> bool {
+    let mut sub_scratch = Scratch::default();
+    let matched = if la.ahead {
+        exec_bool(&la.program, text, pos, &mut sub_scratch)
+    } else {
+        match nth_char_boundary_back(text, pos, la.len) {
+            Some(start) => exec_bool(&la.program, text, start, &mut sub_scratch),
+            None => false,
+        }
+    };
+    matched != la.negative
+}
+
 /// Whether `hay`, case-folded char by char, begins with pre-folded `needle`.
 fn starts_with_folded(hay: &str, needle: &str) -> bool {
     let mut h = hay.chars();
@@ -232,7 +266,9 @@ fn step(program: &Program, pc: usize, c: Option<char>, fc: Option<char>) -> Step
         | Inst::WordBoundary
         | Inst::NotWordBoundary
         | Inst::WordStart
-        | Inst::WordEnd => unreachable!("epsilon inst in thread list"),
+        | Inst::WordEnd
+        | Inst::Lookahead(_)
+        | Inst::Lookbehind(_) => unreachable!("epsilon inst in thread list"),
     }
 }
 
@@ -323,7 +359,7 @@ pub fn exec(
     let next0 = text[from..].chars().next();
     let initial = Rc::new(vec![None; slot_limit.min(program.slot_count)]);
     add_thread(
-        program, clist, visited, *gen, stack, 0, initial, from, len, prev0, next0,
+        program, text, clist, visited, *gen, stack, 0, initial, from, len, prev0, next0,
     );
     // The thread state a scan (re)starts from; used by the fast-forward
     // check below. Captured at `from`: for `from == 0`, a pattern with an
@@ -346,6 +382,7 @@ pub fn exec(
                     clist.clear();
                     add_thread(
                         program,
+                        text,
                         clist,
                         visited,
                         *gen,
@@ -376,6 +413,7 @@ pub fn exec(
             match step(program, pc, c, fc) {
                 Step::Advance => add_thread(
                     program,
+                    text,
                     nlist,
                     visited,
                     *gen,
@@ -426,6 +464,7 @@ pub fn exec(
 #[allow(clippy::too_many_arguments)] // internal; mirrors the VM's state
 fn add_thread(
     program: &Program,
+    text: &str,
     list: &mut Vec<(usize, Slots)>,
     visited: &mut [u64],
     gen: u64,
@@ -499,6 +538,11 @@ fn add_thread(
                     stack.push((pc + 1, slots));
                 }
             }
+            Inst::Lookahead(i) | Inst::Lookbehind(i) => {
+                if lookaround_holds(&program.lookarounds[*i], text, pos) {
+                    stack.push((pc + 1, slots));
+                }
+            }
             Inst::Char(_) | Inst::ScanAny | Inst::AnyChar | Inst::Class(_) | Inst::Match => {
                 list.push((pc, slots));
             }
@@ -536,7 +580,7 @@ pub fn exec_bool(program: &Program, text: &str, from: usize, scratch: &mut Scrat
     let prev0 = text[..from].chars().next_back();
     let next0 = text[from..].chars().next();
     add_thread_bool(
-        program, clist, visited, *gen, stack, 0, from, len, prev0, next0,
+        program, text, clist, visited, *gen, stack, 0, from, len, prev0, next0,
     );
     // Boolean threads are bare pcs, so pc-list equality with the restart
     // state is exact state equality — see the fast-forward note in `exec`.
@@ -556,6 +600,7 @@ pub fn exec_bool(program: &Program, text: &str, from: usize, scratch: &mut Scrat
                     clist.clear();
                     add_thread_bool(
                         program,
+                        text,
                         clist,
                         visited,
                         *gen,
@@ -580,6 +625,7 @@ pub fn exec_bool(program: &Program, text: &str, from: usize, scratch: &mut Scrat
             match step(program, pc, c, fc) {
                 Step::Advance => add_thread_bool(
                     program,
+                    text,
                     nlist,
                     visited,
                     *gen,
@@ -606,6 +652,7 @@ pub fn exec_bool(program: &Program, text: &str, from: usize, scratch: &mut Scrat
 #[allow(clippy::too_many_arguments)] // internal; mirrors the VM's state
 fn add_thread_bool(
     program: &Program,
+    text: &str,
     list: &mut Vec<usize>,
     visited: &mut [u64],
     gen: u64,
@@ -670,6 +717,11 @@ fn add_thread_bool(
                     stack.push(pc + 1);
                 }
             }
+            Inst::Lookahead(i) | Inst::Lookbehind(i) => {
+                if lookaround_holds(&program.lookarounds[*i], text, pos) {
+                    stack.push(pc + 1);
+                }
+            }
             Inst::Char(_) | Inst::ScanAny | Inst::AnyChar | Inst::Class(_) | Inst::Match => {
                 list.push(pc);
             }
@@ -718,7 +770,7 @@ pub fn exec_posix(
     let next0 = text[from..].chars().next();
     let initial = Rc::new(vec![None; slot_limit.min(program.slot_count)]);
     closure_posix(
-        program, best, best_gen, *gen, order, stack, 0, initial, from, len, prev0, next0,
+        program, text, best, best_gen, *gen, order, stack, 0, initial, from, len, prev0, next0,
     );
     harvest(best, order, clist);
     // See the fast-forward note in `exec`.
@@ -735,6 +787,7 @@ pub fn exec_posix(
                     clist.clear();
                     closure_posix(
                         program,
+                        text,
                         best,
                         best_gen,
                         *gen,
@@ -764,6 +817,7 @@ pub fn exec_posix(
             match step(program, pc, c, fc) {
                 Step::Advance => closure_posix(
                     program,
+                    text,
                     best,
                     best_gen,
                     *gen,
@@ -823,6 +877,7 @@ fn harvest(best: &mut [Option<Slots>], order: &mut Vec<usize>, clist: &mut Vec<(
 #[allow(clippy::too_many_arguments)] // internal; mirrors the VM's state
 fn closure_posix(
     program: &Program,
+    text: &str,
     best: &mut [Option<Slots>],
     best_gen: &mut [u64],
     gen: u64,
@@ -905,6 +960,11 @@ fn closure_posix(
             }
             Inst::WordEnd => {
                 if is_word(prev) && !is_word(next) {
+                    stack.push((pc + 1, slots));
+                }
+            }
+            Inst::Lookahead(i) | Inst::Lookbehind(i) => {
+                if lookaround_holds(&program.lookarounds[*i], text, pos) {
                     stack.push((pc + 1, slots));
                 }
             }

@@ -161,4 +161,83 @@ fn main() {
         time(200, || ours.captures(&a512).is_some()),
         time(200, || theirs.captures(&a512).is_some()),
     );
+
+    lookaround_benches(&text);
+}
+
+/// Lookaround is a `rusty_regx`-only extension (see `docs/LOOKAROUND.md`)
+/// — the `regex` crate has no lookahead/lookbehind at all, so there's no
+/// baseline to race against. Instead, each row compares a lookaround
+/// pattern against the `rusty_regx`-only pattern that reaches the same
+/// match decision *without* it (consuming the asserted text instead of
+/// asserting it), to isolate lookaround's own overhead: each check
+/// allocates a fresh `Scratch` and runs a full nested `exec_bool` call
+/// (see the "How it's implemented" section of `docs/LOOKAROUND.md`) —
+/// this is deliberately the simplest correct implementation, not an
+/// optimized one, and these numbers are the evidence for whether that
+/// simplicity is affordable enough to build on.
+fn lookaround_benches(text: &str) {
+    println!();
+    println!(
+        "{:<38} {:>12} {:>12} {:>8}",
+        "lookaround (rusty_regx only)", "lookaround", "equivalent", "×"
+    );
+    let row2 = |name: &str, la: Duration, equiv: Duration| {
+        let factor = la.as_secs_f64() / equiv.as_secs_f64().max(1e-12);
+        println!("{name:<38} {la:>12.1?} {equiv:>12.1?} {factor:>7.1}x");
+    };
+
+    // Lookahead over a full no-match scan: `[0-9]+(?=x)` (assert the `x`)
+    // vs `[0-9]+x` (consume it) — same match decision, only the mechanism
+    // differs.
+    let la = rusty_regx::Regex::new("[0-9]+(?=x)").unwrap();
+    let equiv = rusty_regx::Regex::new("[0-9]+x").unwrap();
+    row2(
+        "is_match, [0-9]+(?=x) 96KB no-match",
+        time(20, || la.is_match(text)),
+        time(20, || equiv.is_match(text)),
+    );
+
+    // Lookbehind: `(?<=[0-9])x` vs `[0-9]x`.
+    let la = rusty_regx::Regex::new("(?<=[0-9])x").unwrap();
+    let equiv = rusty_regx::Regex::new("[0-9]x").unwrap();
+    row2(
+        "is_match, (?<=[0-9])x 96KB no-match",
+        time(20, || la.is_match(text)),
+        time(20, || equiv.is_match(text)),
+    );
+
+    // With real matches to find, not just a full no-match scan: every hit
+    // still re-triggers the lookahead check during the scan itself, since
+    // it gates whether a candidate position is a match at all.
+    let mixed: String = "id 4217x id 99 done 7x more ".repeat(2_000);
+    let la = rusty_regx::Regex::new("[0-9]+(?=x)").unwrap();
+    let equiv = rusty_regx::Regex::new("[0-9]+x").unwrap();
+    row2(
+        "find_iter, [0-9]+(?=x) matches in ~60KB",
+        time(50, || la.find_iter(&mixed).count()),
+        time(50, || equiv.find_iter(&mixed).count()),
+    );
+
+    // Nested lookahead: cost should compound roughly linearly with depth,
+    // since each level is its own independent Scratch allocation + exec_bool
+    // call chained off the outer one.
+    let la = rusty_regx::Regex::new("a(?=b(?=c(?=d)))").unwrap();
+    let equiv = rusty_regx::Regex::new("a(?=bcd)").unwrap();
+    row2(
+        "is_match, 3-deep nested lookahead, 96KB",
+        time(200, || la.is_match(text)),
+        time(200, || equiv.is_match(text)),
+    );
+
+    // Short-string case: the common shell-conditional shape, where
+    // per-call fixed overhead (the Scratch allocation) dominates more
+    // than in a long-haystack scan.
+    let la = rusty_regx::Regex::new("^[a-z]+(?=[0-9])").unwrap();
+    let equiv = rusty_regx::Regex::new("^[a-z]+[0-9]").unwrap();
+    row2(
+        "is_match, ^word(?=digit) short string",
+        time(20_000, || la.is_match("release2026")),
+        time(20_000, || equiv.is_match("release2026")),
+    );
 }

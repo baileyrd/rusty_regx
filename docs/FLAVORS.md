@@ -20,9 +20,10 @@ and the bash-facing rows are verified against live bash 5.2.
 | `a^b`, `a$b` | anchors are anchors anywhere | mid-pattern anchors rejected/literal depending on flavor | differential generator constraint |
 | `x{,3}` `x{,}` | GNU `{0,3}` / `*` | error | `tests/matching.rs` |
 | `[[.a.]]` `[[=a=]]` | degenerate collating/equivalence forms accepted | error | `tests/matching.rs`, bash oracle classes |
-| `(?:…)` `(?i)` `(?<name>…)` | not syntax — ERE has only capturing `( )` | supported | grammar |
+| `(?:…)` | non-capturing group (Perl extension, this branch only — see [`docs/LOOKAROUND.md`](LOOKAROUND.md)) | supported | `tests/lookaround.rs` |
+| `(?i)` `(?<name>…)` | not syntax | supported | grammar |
 | Backreferences `\1` | never (linear-time guarantee) | PCRE yes; crate no | DESIGN.md |
-| Lookaround | never | PCRE yes; crate no | DESIGN.md |
+| Lookaround `(?=` `(?!` `(?<=` `(?<!` | supported on this branch (Perl extension bolted onto ERE — see [`docs/LOOKAROUND.md`](LOOKAROUND.md)); lookbehind is fixed-length only | PCRE yes (variable-length too); crate no | `tests/lookaround.rs` |
 | `{0,0}` intervals | groups keep POSIX numbering | crate elides trailing groups from `Captures::len` | `tests/differential.rs` generator note |
 | POSIX classes on non-ASCII | Unicode `char` fallbacks (UTF-8-locale glibc) | crate POSIX classes are ASCII-only | README locale section, `posix_classes_are_unicode_not_c_locale` |
 | Match semantics | leftmost-first by default; POSIX leftmost-longest via `new_posix` | crate/PCRE: leftmost-first only | `tests/matching.rs`, bash oracles |

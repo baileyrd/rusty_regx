@@ -42,7 +42,7 @@
 //!   overflow.
 
 use crate::ast::{Ast, Class, PosixClass};
-use crate::compile::MAX_REPETITION_SIZE;
+use crate::compile::{fixed_len, MAX_REPETITION_SIZE};
 use crate::error::{Error, ErrorKind};
 
 /// Cap on structural AST nesting depth: how many `Group`/`Repeat` wrappers
@@ -58,6 +58,21 @@ use crate::error::{Error, ErrorKind};
 /// to stop it and aborts the process downstream. 250 matches the `regex`
 /// crate's default `nest_limit`.
 const MAX_NESTING_DEPTH: u32 = 250;
+
+/// Cap on lookaround nesting depth specifically (`(?=(?=(?=…`) — much
+/// stricter than [`MAX_NESTING_DEPTH`], and checked separately. Each
+/// nested lookaround compiles via a full recursive `compile_impl` call on
+/// its own sub-`Program` (see `compile.rs`), not a single flat `emit`
+/// step like an ordinary group — empirically that costs on the order of
+/// 10KB of stack per level (measured by bisecting the crash point across
+/// several `stack_size`-bounded threads), around 15-20x an ordinary
+/// group's per-level cost. 250 levels of that overflows even an 8MB
+/// stack; this cap is chosen to stay safe with real margin down to a
+/// 256KB stack, which is already a conservative assumption for where
+/// pattern compilation might run. Legitimate patterns nest lookaround at
+/// most 2-3 deep in practice, so this is not a practical limitation — see
+/// `docs/LOOKAROUND.md`.
+const MAX_LOOKAROUND_DEPTH: u32 = 16;
 
 /// Rejects a structural depth beyond the cap. `depth` is the depth the node
 /// being constructed *would* have (child depth + 1); `at` is the position to
@@ -78,6 +93,7 @@ pub fn parse(pattern: &str) -> Result<Ast, Error> {
         char_pos: 0,
         group_count: 0,
         depth: 0,
+        in_lookaround: 0,
     };
     let (ast, _depth) = parser.alternation()?;
     if parser.byte_pos < pattern.len() {
@@ -130,6 +146,11 @@ struct Parser<'p> {
     char_pos: usize,
     group_count: u32,
     depth: u32,
+    /// Nesting depth of lookaround bodies currently being parsed (0 when
+    /// not inside one). While positive, `(...)` groups are parsed as plain
+    /// grouping — not capturing — since lookaround assertions don't expose
+    /// their internal captures (see `Ast::Lookaround`).
+    in_lookaround: u32,
 }
 
 impl Parser<'_> {
@@ -253,12 +274,19 @@ impl Parser<'_> {
         match self.bump().expect("atom() called with input remaining") {
             '(' => {
                 let open = self.char_pos - 1;
+                if self.peek() == Some('?') {
+                    return self.special_group(open);
+                }
                 self.depth += 1;
                 if self.depth > MAX_NESTING_DEPTH {
                     return Err(Error::new(ErrorKind::NestingTooDeep, Some(open)));
                 }
-                self.group_count += 1;
-                let index = self.group_count;
+                // Groups nested inside a lookaround body don't capture
+                // (Ast::Lookaround doesn't expose internal captures).
+                let index = (self.in_lookaround == 0).then(|| {
+                    self.group_count += 1;
+                    self.group_count
+                });
                 let (inner, inner_depth) = self.alternation()?;
                 if !self.eat(')') {
                     return Err(Error::new(ErrorKind::UnbalancedParenthesis, Some(open)));
@@ -266,7 +294,11 @@ impl Parser<'_> {
                 self.depth -= 1;
                 let depth = inner_depth + 1;
                 check_depth(depth, open)?;
-                Ok((Ast::Group(index, Box::new(inner)), depth))
+                let ast = match index {
+                    Some(index) => Ast::Group(index, Box::new(inner)),
+                    None => inner,
+                };
+                Ok((ast, depth))
             }
             '[' => Ok((self.bracket()?, 0)),
             '.' => Ok((Ast::AnyChar, 0)),
@@ -292,6 +324,93 @@ impl Parser<'_> {
             },
             c => Ok((Ast::Char(c), 0)),
         }
+    }
+
+    /// Parses a `(?...)` construct: `(?:...)` (non-capturing group),
+    /// `(?=...)`/`(?!...)` (lookahead), or `(?<=...)`/`(?<!...)`
+    /// (lookbehind). The `(` has been consumed (`open` is its char
+    /// position); the `?` has only been peeked.
+    fn special_group(&mut self, open: usize) -> Result<(Ast, u32), Error> {
+        self.bump(); // '?'
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            return Err(Error::new(ErrorKind::NestingTooDeep, Some(open)));
+        }
+        let (ast, depth) = match self.peek() {
+            Some(':') => {
+                self.bump();
+                let (inner, inner_depth) = self.alternation()?;
+                if !self.eat(')') {
+                    return Err(Error::new(ErrorKind::UnbalancedParenthesis, Some(open)));
+                }
+                (inner, inner_depth)
+            }
+            Some('=') | Some('!') => {
+                let negative = self.bump() == Some('!');
+                self.in_lookaround += 1;
+                if self.in_lookaround > MAX_LOOKAROUND_DEPTH {
+                    self.in_lookaround -= 1;
+                    return Err(Error::new(ErrorKind::NestingTooDeep, Some(open)));
+                }
+                let inner = self.alternation();
+                self.in_lookaround -= 1;
+                let (inner, inner_depth) = inner?;
+                if !self.eat(')') {
+                    return Err(Error::new(ErrorKind::UnbalancedParenthesis, Some(open)));
+                }
+                let depth = inner_depth + 1;
+                check_depth(depth, open)?;
+                (
+                    Ast::Lookaround {
+                        ahead: true,
+                        negative,
+                        inner: Box::new(inner),
+                    },
+                    depth,
+                )
+            }
+            Some('<') => {
+                self.bump();
+                let negative = match self.bump() {
+                    Some('=') => false,
+                    Some('!') => true,
+                    _ => return Err(Error::new(ErrorKind::InvalidGroupSyntax, Some(open))),
+                };
+                self.in_lookaround += 1;
+                if self.in_lookaround > MAX_LOOKAROUND_DEPTH {
+                    self.in_lookaround -= 1;
+                    return Err(Error::new(ErrorKind::NestingTooDeep, Some(open)));
+                }
+                let inner = self.alternation();
+                self.in_lookaround -= 1;
+                let (inner, inner_depth) = inner?;
+                if !self.eat(')') {
+                    return Err(Error::new(ErrorKind::UnbalancedParenthesis, Some(open)));
+                }
+                // Lookbehind is only supported at fixed length (see
+                // `fixed_len`'s doc comment): checking it here, right
+                // after parsing, means the error can carry the `(`'s
+                // position — the compiler's own check (defense in depth
+                // for the `expect` in `emit`) can't, since by then the
+                // position information is gone.
+                if fixed_len(&inner).is_none() {
+                    return Err(Error::new(ErrorKind::VariableLengthLookbehind, Some(open)));
+                }
+                let depth = inner_depth + 1;
+                check_depth(depth, open)?;
+                (
+                    Ast::Lookaround {
+                        ahead: false,
+                        negative,
+                        inner: Box::new(inner),
+                    },
+                    depth,
+                )
+            }
+            _ => return Err(Error::new(ErrorKind::InvalidGroupSyntax, Some(open))),
+        };
+        self.depth -= 1;
+        Ok((ast, depth))
     }
 
     /// Parses `{m}`, `{m,}`, or `{m,n}`; the leading `{` has been peeked.
