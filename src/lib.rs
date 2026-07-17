@@ -441,6 +441,17 @@ impl<'t> Match<'t> {
     pub fn as_str(&self) -> &'t str {
         &self.text[self.start..self.end]
     }
+
+    /// The match's length in bytes.
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Whether this is a zero-width match (empty matches are legal and
+    /// handled specially by the iteration APIs).
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
 }
 
 /// The shared iteration step (the `regex` crate's rule): resume at the
@@ -480,6 +491,7 @@ fn iter_step(
 
 /// An iterator over all non-overlapping matches (see
 /// [`Regex::find_iter`]). VM working buffers are reused across matches.
+#[derive(Debug)]
 pub struct FindIter<'r, 't> {
     re: &'r Regex,
     text: &'t str,
@@ -509,6 +521,7 @@ impl<'t> Iterator for FindIter<'_, 't> {
 
 /// An iterator over all non-overlapping matches with full captures (see
 /// [`Regex::captures_iter`]).
+#[derive(Debug)]
 pub struct CapturesIter<'r, 't> {
     re: &'r Regex,
     text: &'t str,

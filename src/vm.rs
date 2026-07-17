@@ -189,7 +189,7 @@ fn at_restart(clist: &[(usize, Slots)], restart: &[usize], pos: usize) -> bool {
 /// is amortized over all matches. Generations are monotonic within a
 /// `Scratch`, so stale visited/best stamps can never collide across
 /// reuses; thread lists are cleared at each entry.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Scratch {
     clist: Vec<(usize, Slots)>,
     nlist: Vec<(usize, Slots)>,
