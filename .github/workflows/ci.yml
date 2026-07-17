@@ -19,6 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust
         run: rustup update stable && rustup default stable
+      - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
@@ -29,3 +30,41 @@ jobs:
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # The declared MSRV (Cargo.toml rust-version) is a promise; the code even
+  # carries manual workarounds for it (map_or over is_none_or in vm.rs).
+  # This job is what stops an accidental newer-Rust idiom from landing.
+  msrv:
+    name: MSRV (1.75)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MSRV Rust
+        run: rustup toolchain install 1.75 --profile minimal && rustup default 1.75
+      - uses: Swatinem/rust-cache@v2
+      - name: Test on MSRV
+        run: cargo test --all-targets
+
+  fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly Rust
+        run: rustup update nightly && rustup default nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # A short smoke run per target on every change; real coverage comes
+      # from longer local runs (`cargo +nightly fuzz run <target>`).
+      - name: Fuzz each target briefly
+        run: |
+          for target in parse exec differential; do
+            cargo fuzz run "$target" -- -max_total_time=60 -max_len=512
+          done

@@ -1,7 +1,7 @@
 //! End-to-end matching tests through the public API, including the
 //! adversarial linear-time tests required by DESIGN.md from day one.
 
-use rusty_regx::{Error, Regex};
+use rusty_regx::{ErrorKind, Regex};
 
 /// Group 0 of the leftmost match, or None.
 fn find<'t>(pattern: &str, text: &'t str) -> Option<&'t str> {
@@ -139,6 +139,25 @@ fn dot_and_utf8() {
     assert_eq!(find("é+", "ééé"), Some("ééé"));
 }
 
+/// Pins the *intended* divergence from the `C` locale (see README):
+/// POSIX classes use Unicode `char` fallbacks, matching glibc in a UTF-8
+/// locale — not `LC_ALL=C`, where classes are ASCII-only. If one of these
+/// assertions starts failing, the engine's locale stance changed.
+#[test]
+fn posix_classes_are_unicode_not_c_locale() {
+    // Matches here and in UTF-8 bash; fails in bash under LC_ALL=C.
+    assert_eq!(find("[[:alpha:]]+", "héllo"), Some("héllo"));
+    assert_eq!(find("[[:alnum:]]", "×é×"), Some("é"));
+    assert_eq!(find("[[:space:]]", "a\u{a0}b"), Some("\u{a0}"));
+    assert_eq!(find("[[:lower:]]+", "σφ"), Some("σφ"));
+    assert_eq!(find("[[:upper:]]+", "ΣΦ"), Some("ΣΦ"));
+    // ASCII-first classes stay ASCII-only in every locale: digit, xdigit,
+    // blank, graph, print, punct never took the Unicode fallback.
+    assert_eq!(find("[[:digit:]]", "٣"), None); // Arabic-Indic three
+    assert_eq!(find("[[:xdigit:]]", "ａ"), None); // fullwidth a
+    assert_eq!(find("[[:punct:]]", "«"), None);
+}
+
 #[test]
 fn rush_shaped_patterns() {
     // The kinds of patterns rush's C56 conditional exercises.
@@ -162,15 +181,83 @@ fn rush_shaped_patterns() {
 }
 
 #[test]
+fn is_match_agrees_with_captures_in_every_mode() {
+    let cases = [
+        ("a|ab", "xab"),
+        ("^abc$", "ABC"),
+        ("(a+)+b", "aaaa"),
+        ("[[:digit:]]+", "abc123"),
+        ("", ""),
+        ("a", ""),
+        ("^$", "x"),
+        ("(a?)*", "b"),
+    ];
+    for (pattern, text) in cases {
+        for re in [
+            Regex::new(pattern).unwrap(),
+            Regex::new_posix(pattern).unwrap(),
+            Regex::new_ci(pattern).unwrap(),
+            Regex::new_posix_ci(pattern).unwrap(),
+        ] {
+            assert_eq!(
+                re.is_match(text),
+                re.captures(text).is_some(),
+                "is_match/captures disagree on pattern {pattern:?}, text {text:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn new_ci_is_leftmost_first_and_case_insensitive() {
+    let re = Regex::new_ci("a|ab").unwrap();
+    // Leftmost-first: the first alternative wins, unlike new_posix_ci.
+    assert_eq!(re.captures("AB").unwrap().get(0), Some("A"));
+    assert!(Regex::new_ci("^abc$").unwrap().is_match("ABC"));
+    // Captures keep the original case, same as the POSIX ci mode.
+    assert_eq!(
+        groups_of(&Regex::new_ci("^(a)(b)").unwrap(), "ABC"),
+        Some(vec![Some("AB".into()), Some("A".into()), Some("B".into())])
+    );
+    // Same folding rules as new_posix_ci.
+    assert!(Regex::new_ci("[X-Z]").unwrap().is_match("y"));
+    assert_eq!(
+        Regex::new_ci("[Z-a]").unwrap_err().kind(),
+        ErrorKind::InvalidRange
+    );
+}
+
+#[test]
+fn regex_reports_its_pattern() {
+    let re = Regex::new("a|b").unwrap();
+    assert_eq!(re.as_str(), "a|b");
+    assert_eq!(re.to_string(), "a|b");
+    assert_eq!(format!("{re:?}"), r#"Regex("a|b")"#);
+    // Clone produces an equivalent, independently usable regex.
+    let clone = re.clone();
+    assert_eq!(clone.as_str(), "a|b");
+    assert!(clone.is_match("xby"));
+}
+
+/// All groups via an already-compiled regex.
+fn groups_of(re: &Regex, text: &str) -> Option<Vec<Option<String>>> {
+    re.captures(text).map(|caps| {
+        (0..caps.len())
+            .map(|i| caps.get(i).map(str::to_owned))
+            .collect()
+    })
+}
+
+#[test]
 fn repetition_size_limits() {
     assert_eq!(
-        Regex::new("a{1001}").unwrap_err(),
-        Error::RepetitionTooLarge
+        Regex::new("a{1001}").unwrap_err().kind(),
+        ErrorKind::RepetitionTooLarge
     );
     // Within the per-interval cap but past the program-size cap.
     assert_eq!(
-        Regex::new("(a{1000}){1000}").unwrap_err(),
-        Error::RepetitionTooLarge
+        Regex::new("(a{1000}){1000}").unwrap_err().kind(),
+        ErrorKind::RepetitionTooLarge
     );
     assert!(Regex::new("a{1000}").is_ok());
 }
@@ -299,8 +386,8 @@ fn posix_ci_range_reversed_after_folding_is_an_error() {
     // bash rejects it under nocasematch (exit 2 from `=~`).
     assert!(Regex::new_posix("[Z-a]").is_ok());
     assert_eq!(
-        Regex::new_posix_ci("[Z-a]").unwrap_err(),
-        Error::InvalidRange
+        Regex::new_posix_ci("[Z-a]").unwrap_err().kind(),
+        ErrorKind::InvalidRange
     );
 }
 

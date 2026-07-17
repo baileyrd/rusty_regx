@@ -38,6 +38,7 @@
 //! See `DESIGN.md` in the repository for the full design and roadmap.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 mod ast;
 mod compile;
@@ -45,13 +46,29 @@ mod error;
 mod parser;
 mod vm;
 
-pub use error::Error;
+pub use error::{Error, ErrorKind};
 
 /// A compiled regular expression program.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct Regex {
+    pattern: Box<str>,
     program: compile::Program,
     posix: bool,
+}
+
+/// Shows the original pattern, like the `regex` crate — the compiled
+/// bytecode is an implementation detail.
+impl std::fmt::Debug for Regex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Regex").field(&self.pattern).finish()
+    }
+}
+
+/// Displays the original pattern.
+impl std::fmt::Display for Regex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.pattern)
+    }
 }
 
 impl Regex {
@@ -88,7 +105,7 @@ impl Regex {
     /// - Range endpoints fold too: `[a-f]` also matches `A`–`F`, `[X-Z]`
     ///   also matches `x`–`z` — but `a` still does *not* match `[X-Z]`.
     ///   A range that is reversed after folding (e.g. `[Z-a]`) is an
-    ///   [`Error::InvalidRange`], as glibc rejects it.
+    ///   [`ErrorKind::InvalidRange`], as glibc rejects it.
     /// - `[[:upper:]]` and `[[:lower:]]` both behave as `[[:alpha:]]` —
     ///   glibc's `REG_ICASE` rule, so `[[ ABC =~ [[:lower:]]bc ]]` matches
     ///   under `nocasematch` in real bash.
@@ -98,10 +115,39 @@ impl Regex {
         Self::compile(pattern, true, true)
     }
 
+    /// As [`Regex::new`] (leftmost-first semantics), but case-insensitive.
+    ///
+    /// Folding is identical to [`Regex::new_posix_ci`]'s: `REG_ICASE`
+    /// semantics — pattern literals, range endpoints, and input fold to
+    /// uppercase; `[[:upper:]]`/`[[:lower:]]` behave as `[[:alpha:]]`;
+    /// captures report the original input spans.
+    pub fn new_ci(pattern: &str) -> Result<Regex, Error> {
+        Self::compile(pattern, false, true)
+    }
+
     fn compile(pattern: &str, posix: bool, icase: bool) -> Result<Regex, Error> {
         let ast = parser::parse(pattern)?;
         let program = compile::compile(&ast, icase)?;
-        Ok(Regex { program, posix })
+        Ok(Regex {
+            pattern: pattern.into(),
+            program,
+            posix,
+        })
+    }
+
+    /// The pattern this regex was compiled from.
+    pub fn as_str(&self) -> &str {
+        &self.pattern
+    }
+
+    /// Whether `text` contains a match, without computing capture groups.
+    ///
+    /// Equivalent to `self.captures(text).is_some()` but faster: the VM
+    /// skips capture tracking entirely, and match *existence* does not
+    /// depend on the match semantics, so this is the same single fast path
+    /// in every mode (including POSIX).
+    pub fn is_match(&self, text: &str) -> bool {
+        vm::exec_bool(&self.program, text)
     }
 
     /// Searches `text` for the leftmost match, returning the capture groups.

@@ -6,6 +6,7 @@ rust-version = "1.75"
 description = "A minimal, linear-time POSIX-ERE regex engine with no dependencies"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/baileyrd/rusty_regx"
+readme = "README.md"
 keywords = ["regex", "posix", "ere"]
 categories = ["text-processing"]
 
@@ -14,5 +15,9 @@ categories = ["text-processing"]
 
 [dev-dependencies]
 # Dev-only: the reference implementation for the differential harness
-# (tests/differential.rs). Never a runtime dependency.
+# (tests/differential.rs) and the benchmarks. Never a runtime dependency.
 regex = "1"
+
+[[bench]]
+name = "compare"
+harness = false

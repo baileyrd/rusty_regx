@@ -22,7 +22,7 @@
 //!   pattern is rejected rather than risking a stack overflow.
 
 use crate::ast::{Ast, Class, PosixClass};
-use crate::error::Error;
+use crate::error::{Error, ErrorKind};
 
 /// Cap on group-nesting depth. The parser recurses per nesting level (as do
 /// the compiler's AST walks and the AST's own `Drop`), so without a cap a
@@ -42,7 +42,10 @@ pub fn parse(pattern: &str) -> Result<Ast, Error> {
     let ast = parser.alternation()?;
     if parser.pos < parser.chars.len() {
         // alternation() only stops early on `)`.
-        return Err(Error::UnbalancedParenthesis);
+        return Err(Error::new(
+            ErrorKind::UnbalancedParenthesis,
+            Some(parser.pos),
+        ));
     }
     Ok(ast)
 }
@@ -103,8 +106,11 @@ impl Parser {
                 Some('+') => self.quantify(&mut items, 1, None)?,
                 Some('?') => self.quantify(&mut items, 0, Some(1))?,
                 Some('{') => {
+                    let at = self.pos;
                     let (min, max) = self.interval()?;
-                    let ast = items.pop().ok_or(Error::DanglingQuantifier)?;
+                    let ast = items
+                        .pop()
+                        .ok_or(Error::new(ErrorKind::DanglingQuantifier, Some(at)))?;
                     items.push(Ast::Repeat {
                         ast: Box::new(ast),
                         min,
@@ -124,8 +130,11 @@ impl Parser {
 
     /// Applies `* + ?` (already peeked) to the preceding atom.
     fn quantify(&mut self, items: &mut Vec<Ast>, min: u32, max: Option<u32>) -> Result<(), Error> {
+        let at = self.pos;
         self.bump();
-        let ast = items.pop().ok_or(Error::DanglingQuantifier)?;
+        let ast = items
+            .pop()
+            .ok_or(Error::new(ErrorKind::DanglingQuantifier, Some(at)))?;
         items.push(Ast::Repeat {
             ast: Box::new(ast),
             min,
@@ -138,15 +147,16 @@ impl Parser {
     fn atom(&mut self) -> Result<Ast, Error> {
         match self.bump().expect("atom() called with input remaining") {
             '(' => {
+                let open = self.pos - 1;
                 self.depth += 1;
                 if self.depth > MAX_NESTING_DEPTH {
-                    return Err(Error::NestingTooDeep);
+                    return Err(Error::new(ErrorKind::NestingTooDeep, Some(open)));
                 }
                 self.group_count += 1;
                 let index = self.group_count;
                 let inner = self.alternation()?;
                 if !self.eat(')') {
-                    return Err(Error::UnbalancedParenthesis);
+                    return Err(Error::new(ErrorKind::UnbalancedParenthesis, Some(open)));
                 }
                 self.depth -= 1;
                 Ok(Ast::Group(index, Box::new(inner)))
@@ -157,7 +167,7 @@ impl Parser {
             '$' => Ok(Ast::EndAnchor),
             '\\' => match self.bump() {
                 Some(c) => Ok(Ast::Char(c)),
-                None => Err(Error::TrailingBackslash),
+                None => Err(Error::new(ErrorKind::TrailingBackslash, Some(self.pos - 1))),
             },
             c => Ok(Ast::Char(c)),
         }
@@ -165,44 +175,48 @@ impl Parser {
 
     /// Parses `{m}`, `{m,}`, or `{m,n}`; the leading `{` has been peeked.
     fn interval(&mut self) -> Result<(u32, Option<u32>), Error> {
+        let open = self.pos;
+        let err = || Error::new(ErrorKind::InvalidInterval, Some(open));
         self.bump();
-        let min = self.integer()?;
+        let min = self.integer(open)?;
         if self.eat('}') {
             return Ok((min, Some(min)));
         }
         if !self.eat(',') {
-            return Err(Error::InvalidInterval);
+            return Err(err());
         }
         if self.eat('}') {
             return Ok((min, None));
         }
-        let max = self.integer()?;
+        let max = self.integer(open)?;
         if !self.eat('}') {
-            return Err(Error::InvalidInterval);
+            return Err(err());
         }
         if min > max {
-            return Err(Error::InvalidInterval);
+            return Err(err());
         }
         Ok((min, Some(max)))
     }
 
-    fn integer(&mut self) -> Result<u32, Error> {
+    /// `at` is the interval's `{`, where any failure is reported.
+    fn integer(&mut self, at: usize) -> Result<u32, Error> {
         let start = self.pos;
         while self.peek().is_some_and(|c| c.is_ascii_digit()) {
             self.pos += 1;
         }
         if self.pos == start {
-            return Err(Error::InvalidInterval);
+            return Err(Error::new(ErrorKind::InvalidInterval, Some(at)));
         }
         self.chars[start..self.pos]
             .iter()
             .collect::<String>()
             .parse()
-            .map_err(|_| Error::InvalidInterval)
+            .map_err(|_| Error::new(ErrorKind::InvalidInterval, Some(at)))
     }
 
     /// Parses a bracket expression; the leading `[` has been consumed.
     fn bracket(&mut self) -> Result<Ast, Error> {
+        let open = self.pos - 1;
         let negated = self.eat('^');
         let mut class = Class {
             negated,
@@ -212,7 +226,7 @@ impl Parser {
         let mut first = true;
         loop {
             match self.peek() {
-                None => return Err(Error::UnclosedBracket),
+                None => return Err(Error::new(ErrorKind::UnclosedBracket, Some(open))),
                 Some(']') if !first => {
                     self.bump();
                     break;
@@ -227,6 +241,7 @@ impl Parser {
 
     /// One bracket item: a POSIX class, a range `a-z`, or a literal char.
     fn bracket_item(&mut self, class: &mut Class) -> Result<(), Error> {
+        let start = self.pos;
         if self.peek() == Some('[') {
             match self.peek_at(1) {
                 Some(':') => {
@@ -234,7 +249,9 @@ impl Parser {
                     return Ok(());
                 }
                 // Collating symbols and equivalence classes are out of scope.
-                Some('.') | Some('=') => return Err(Error::InvalidPosixClass),
+                Some('.') | Some('=') => {
+                    return Err(Error::new(ErrorKind::InvalidPosixClass, Some(start)))
+                }
                 _ => {}
             }
         }
@@ -246,10 +263,10 @@ impl Parser {
             let hi = self.bump().expect("checked non-empty");
             // A class can't be a range endpoint: `[a-[:digit:]]`.
             if hi == '[' && matches!(self.peek(), Some(':') | Some('.') | Some('=')) {
-                return Err(Error::InvalidRange);
+                return Err(Error::new(ErrorKind::InvalidRange, Some(start)));
             }
             if lo > hi {
-                return Err(Error::InvalidRange);
+                return Err(Error::new(ErrorKind::InvalidRange, Some(start)));
             }
             class.ranges.push((lo, hi));
         } else {
@@ -260,6 +277,8 @@ impl Parser {
 
     /// Parses `[:name:]`; the leading `[` has been peeked (not consumed).
     fn posix_class(&mut self) -> Result<PosixClass, Error> {
+        let open = self.pos;
+        let err = || Error::new(ErrorKind::InvalidPosixClass, Some(open));
         self.bump(); // `[`
         self.bump(); // `:`
         let start = self.pos;
@@ -268,7 +287,7 @@ impl Parser {
         }
         let name: String = self.chars[start..self.pos].iter().collect();
         if !(self.eat(':') && self.eat(']')) {
-            return Err(Error::InvalidPosixClass);
+            return Err(err());
         }
         match name.as_str() {
             "alnum" => Ok(PosixClass::Alnum),
@@ -283,7 +302,7 @@ impl Parser {
             "space" => Ok(PosixClass::Space),
             "upper" => Ok(PosixClass::Upper),
             "xdigit" => Ok(PosixClass::Xdigit),
-            _ => Err(Error::InvalidPosixClass),
+            _ => Err(err()),
         }
     }
 }
@@ -294,6 +313,11 @@ mod tests {
 
     fn ch(c: char) -> Ast {
         Ast::Char(c)
+    }
+
+    /// The error kind a pattern fails with.
+    fn err(pattern: &str) -> ErrorKind {
+        parse(pattern).unwrap_err().kind()
     }
 
     fn class(negated: bool, ranges: &[(char, char)], posix: &[PosixClass]) -> Ast {
@@ -351,7 +375,7 @@ mod tests {
         );
         // Any escaped char is that literal char (no Perl classes).
         assert_eq!(parse(r"\d"), Ok(ch('d')));
-        assert_eq!(parse(r"a\"), Err(Error::TrailingBackslash));
+        assert_eq!(err(r"a\"), ErrorKind::TrailingBackslash);
     }
 
     #[test]
@@ -380,9 +404,9 @@ mod tests {
                 ]))
             ))
         );
-        assert_eq!(parse("(a"), Err(Error::UnbalancedParenthesis));
-        assert_eq!(parse("a)"), Err(Error::UnbalancedParenthesis));
-        assert_eq!(parse("(a))"), Err(Error::UnbalancedParenthesis));
+        assert_eq!(err("(a"), ErrorKind::UnbalancedParenthesis);
+        assert_eq!(err("a)"), ErrorKind::UnbalancedParenthesis);
+        assert_eq!(err("(a))"), ErrorKind::UnbalancedParenthesis);
     }
 
     #[test]
@@ -412,11 +436,11 @@ mod tests {
 
     #[test]
     fn dangling_quantifiers() {
-        assert_eq!(parse("*a"), Err(Error::DanglingQuantifier));
-        assert_eq!(parse("+"), Err(Error::DanglingQuantifier));
-        assert_eq!(parse("a|?"), Err(Error::DanglingQuantifier));
-        assert_eq!(parse("(*)"), Err(Error::DanglingQuantifier));
-        assert_eq!(parse("{2}"), Err(Error::DanglingQuantifier));
+        assert_eq!(err("*a"), ErrorKind::DanglingQuantifier);
+        assert_eq!(err("+"), ErrorKind::DanglingQuantifier);
+        assert_eq!(err("a|?"), ErrorKind::DanglingQuantifier);
+        assert_eq!(err("(*)"), ErrorKind::DanglingQuantifier);
+        assert_eq!(err("{2}"), ErrorKind::DanglingQuantifier);
     }
 
     #[test]
@@ -440,7 +464,7 @@ mod tests {
             "a{3,",
             "a{99999999999999999999}",
         ] {
-            assert_eq!(parse(pattern), Err(Error::InvalidInterval), "{pattern}");
+            assert_eq!(err(pattern), ErrorKind::InvalidInterval, "{pattern}");
         }
     }
 
@@ -492,12 +516,12 @@ mod tests {
 
     #[test]
     fn bracket_errors() {
-        assert_eq!(parse("[abc"), Err(Error::UnclosedBracket));
-        assert_eq!(parse("[a-"), Err(Error::UnclosedBracket));
-        assert_eq!(parse("[]"), Err(Error::UnclosedBracket));
-        assert_eq!(parse("[^]"), Err(Error::UnclosedBracket));
-        assert_eq!(parse("[z-a]"), Err(Error::InvalidRange));
-        assert_eq!(parse("[a-[:digit:]]"), Err(Error::InvalidRange));
+        assert_eq!(err("[abc"), ErrorKind::UnclosedBracket);
+        assert_eq!(err("[a-"), ErrorKind::UnclosedBracket);
+        assert_eq!(err("[]"), ErrorKind::UnclosedBracket);
+        assert_eq!(err("[^]"), ErrorKind::UnclosedBracket);
+        assert_eq!(err("[z-a]"), ErrorKind::InvalidRange);
+        assert_eq!(err("[a-[:digit:]]"), ErrorKind::InvalidRange);
     }
 
     #[test]
@@ -520,12 +544,12 @@ mod tests {
         ] {
             assert!(parse(&format!("[[:{name}:]]")).is_ok(), "{name}");
         }
-        assert_eq!(parse("[[:foo:]]"), Err(Error::InvalidPosixClass));
-        assert_eq!(parse("[[:alpha]]"), Err(Error::InvalidPosixClass));
-        assert_eq!(parse("[[:alpha"), Err(Error::InvalidPosixClass));
+        assert_eq!(err("[[:foo:]]"), ErrorKind::InvalidPosixClass);
+        assert_eq!(err("[[:alpha]]"), ErrorKind::InvalidPosixClass);
+        assert_eq!(err("[[:alpha"), ErrorKind::InvalidPosixClass);
         // Collating symbols and equivalence classes are unsupported.
-        assert_eq!(parse("[[.a.]]"), Err(Error::InvalidPosixClass));
-        assert_eq!(parse("[[=a=]]"), Err(Error::InvalidPosixClass));
+        assert_eq!(err("[[.a.]]"), ErrorKind::InvalidPosixClass);
+        assert_eq!(err("[[=a=]]"), ErrorKind::InvalidPosixClass);
         // A `[` not followed by `:` `.` `=` is a literal inside brackets.
         assert_eq!(
             parse("[[a]"),
@@ -540,14 +564,38 @@ mod tests {
         assert!(parse(&deep).is_ok());
         // One past the cap: rejected.
         let too_deep = "(".repeat(251) + "a" + &")".repeat(251);
-        assert_eq!(parse(&too_deep), Err(Error::NestingTooDeep));
+        assert_eq!(err(&too_deep), ErrorKind::NestingTooDeep);
         // Nesting is what's capped, not the total number of groups.
         let wide = "(a)".repeat(10_000);
         assert!(parse(&wide).is_ok());
         // The original crash case: a pathological pattern must be an error,
         // never a stack overflow (this used to abort the process).
         let pathological = "(".repeat(500_000);
-        assert_eq!(parse(&pathological), Err(Error::NestingTooDeep));
+        assert_eq!(err(&pathological), ErrorKind::NestingTooDeep);
+    }
+
+    #[test]
+    fn errors_carry_positions() {
+        // Positions are 0-based char offsets of the offending construct.
+        let e = parse("ab[cd").unwrap_err();
+        assert_eq!(
+            (e.kind(), e.position()),
+            (ErrorKind::UnclosedBracket, Some(2))
+        );
+        assert_eq!(e.to_string(), "unclosed bracket expression at position 2");
+        let e = parse("a(b(c)").unwrap_err();
+        assert_eq!(
+            (e.kind(), e.position()),
+            (ErrorKind::UnbalancedParenthesis, Some(1))
+        );
+        assert_eq!(parse("ab)").unwrap_err().position(), Some(2));
+        assert_eq!(parse("ab*c{2,1}").unwrap_err().position(), Some(4));
+        assert_eq!(parse("a|*b").unwrap_err().position(), Some(2));
+        assert_eq!(parse("ab[x[:foo:]]").unwrap_err().position(), Some(4));
+        assert_eq!(parse("a[z-a]").unwrap_err().position(), Some(2));
+        assert_eq!(parse(r"ab\").unwrap_err().position(), Some(2));
+        // Positions count chars, not bytes.
+        assert_eq!(parse("éé[").unwrap_err().position(), Some(2));
     }
 
     #[test]

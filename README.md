@@ -1,5 +1,7 @@
 # rusty_regx
 
+[![CI](https://github.com/baileyrd/rusty_regx/actions/workflows/ci.yml/badge.svg)](https://github.com/baileyrd/rusty_regx/actions/workflows/ci.yml)
+
 A minimal, linear-time [POSIX Extended Regular
 Expression](https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap09.html)
 engine in Rust, with **zero dependencies** and **no backtracking**.
@@ -50,7 +52,9 @@ if let Some(caps) = re.captures("release-2026") {
 }
 ```
 
-Matching is an unanchored search (like bash `=~`). `Regex::new` uses
+Matching is an unanchored search (like bash `=~`). When only match/no-match
+is needed, `is_match` skips capture tracking entirely and is faster than
+`captures`. `Regex::new` uses
 leftmost-first semantics, identical to the `regex` crate. `Regex::new_posix`
 opts into POSIX leftmost-longest semantics — what real bash/glibc report:
 
@@ -67,7 +71,7 @@ longest-alternative rule, which glibc itself deviates from in rare corners
 (~0.01% of randomly generated cases).
 
 `Regex::new_posix_ci` adds case-insensitive matching on top of the POSIX
-mode — POSIX `REG_ICASE`, which is what bash applies to `=~` under
+mode (`Regex::new_ci` is its leftmost-first counterpart) — POSIX `REG_ICASE`, which is what bash applies to `=~` under
 `shopt -s nocasematch`. Folding happens per character at comparison time
 (never in the captured text) and matches glibc exactly: literals and range
 endpoints fold, and `[[:upper:]]`/`[[:lower:]]` both behave as
@@ -80,6 +84,16 @@ let re = Regex::new_posix_ci("^(a)(b)c$")?;
 let caps = re.captures("ABC").unwrap();
 assert_eq!(caps.get(1), Some("A")); // captures keep the original case
 ```
+
+## POSIX classes and locales
+
+POSIX classes use Rust `char` semantics where they have a sensible Unicode
+meaning (no Unicode tables are bundled): `[[:alpha:]]` matches `é`,
+`[[:space:]]` matches U+00A0. This is what glibc does in a UTF-8 locale,
+but **not** in the `C` locale, where classes are ASCII-only — so
+`[[ é =~ [[:alpha:]] ]]` succeeds here and in a UTF-8 bash, yet fails
+under `LC_ALL=C`. rush runs UTF-8-first, so this engine deliberately sides
+with the UTF-8 behavior; the divergence is pinned by tests.
 
 See [DESIGN.md](DESIGN.md) for the architecture and full roadmap.
 
