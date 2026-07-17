@@ -34,6 +34,48 @@ use std::rc::Rc;
 /// `Send + Sync`.
 type Slots = Rc<Vec<Option<usize>>>;
 
+/// One thread's outcome stepping over the current input char — the single
+/// point of truth for consuming-instruction dispatch, shared by all three
+/// execution modes (`c` is the raw char, `fc` the case-folded one).
+enum Step {
+    /// The instruction consumed the char; continue at `pc + 1`.
+    Advance,
+    /// The thread dies.
+    Die,
+    /// The thread reached `Match`.
+    Matched,
+}
+
+fn step(program: &Program, pc: usize, c: Option<char>, fc: Option<char>) -> Step {
+    match program.insts[pc] {
+        Inst::Char(x) if fc == Some(x) => Step::Advance,
+        Inst::AnyChar if c.is_some() => Step::Advance,
+        Inst::Class(i) if fc.is_some_and(|ch| class_matches(&program.classes[i], ch)) => {
+            Step::Advance
+        }
+        Inst::Char(_) | Inst::AnyChar | Inst::Class(_) => Step::Die,
+        Inst::Match => Step::Matched,
+        // Epsilon instructions are resolved inside the closures.
+        Inst::Split { .. }
+        | Inst::Jump(_)
+        | Inst::Save(_)
+        | Inst::StartAnchor
+        | Inst::EndAnchor => unreachable!("epsilon inst in thread list"),
+    }
+}
+
+/// Whether a slot-carrying thread list is indistinguishable from a fresh
+/// restart at `pos`: same pcs as the position-0 restart state, and every
+/// recorded offset equals `pos` — no thread carries progress. The
+/// fast-forward precondition (see [`exec`]).
+fn at_restart(clist: &[(usize, Slots)], restart: &[usize], pos: usize) -> bool {
+    clist.len() == restart.len()
+        && clist.iter().map(|t| t.0).eq(restart.iter().copied())
+        && clist
+            .iter()
+            .all(|(_, s)| s.iter().flatten().all(|&v| v == pos))
+}
+
 /// Executes `program` against `text` as an unanchored, leftmost-first
 /// search.
 ///
@@ -43,7 +85,10 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
     let len = text.len();
     let mut clist: Vec<(usize, Slots)> = Vec::new();
     let mut nlist: Vec<(usize, Slots)> = Vec::new();
-    let mut visited = vec![false; program.insts.len()];
+    // Generation-stamped visited set: bumping `gen` invalidates every
+    // entry in O(1) instead of an O(program) clear per input char.
+    let mut visited = vec![0u64; program.insts.len()];
+    let mut gen = 1u64;
     // Reused across every add_thread call; always drained back to empty.
     let mut stack: Vec<(usize, Slots)> = Vec::new();
     let mut matched: Option<Slots> = None;
@@ -53,6 +98,7 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
         program,
         &mut clist,
         &mut visited,
+        gen,
         &mut stack,
         0,
         initial,
@@ -68,28 +114,22 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
     let mut pos = 0;
     loop {
         // Fast-forward: when the pattern requires a literal first char and
-        // every live thread is indistinguishable from a fresh restart
-        // (same pcs, and every recorded offset equals the current position
-        // — i.e. no thread carries progress), nothing can match before the
-        // next occurrence of that char. Skip the scan straight to it.
+        // no live thread carries progress (see `at_restart`), nothing can
+        // match before the next occurrence of that char — skip straight
+        // to it.
         if let Some(want) = program.prefix_char {
-            if matched.is_none()
-                && clist.len() == restart.len()
-                && clist.iter().map(|t| t.0).eq(restart.iter().copied())
-                && clist
-                    .iter()
-                    .all(|(_, s)| s.iter().flatten().all(|&v| v == pos))
-            {
+            if matched.is_none() && at_restart(&clist, &restart, pos) {
                 match text[pos..].find(want) {
                     Some(0) => {}
                     Some(off) => {
                         pos += off;
-                        visited.fill(false);
+                        gen += 1;
                         clist.clear();
                         add_thread(
                             program,
                             &mut clist,
                             &mut visited,
+                            gen,
                             &mut stack,
                             0,
                             Rc::new(vec![None; program.slot_count]),
@@ -107,65 +147,29 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
         // The pattern side was folded at compile time; fold the input to
         // match. Positions (and so captures) always use the original text.
         let fc = if program.icase { c.map(fold) } else { c };
-        visited.fill(false);
+        gen += 1;
         nlist.clear();
         for (pc, slots) in clist.drain(..) {
-            match &program.insts[pc] {
-                Inst::Char(x) => {
-                    if fc == Some(*x) {
-                        add_thread(
-                            program,
-                            &mut nlist,
-                            &mut visited,
-                            &mut stack,
-                            pc + 1,
-                            slots,
-                            next_pos,
-                            len,
-                        );
-                    }
-                }
-                Inst::AnyChar => {
-                    if c.is_some() {
-                        add_thread(
-                            program,
-                            &mut nlist,
-                            &mut visited,
-                            &mut stack,
-                            pc + 1,
-                            slots,
-                            next_pos,
-                            len,
-                        );
-                    }
-                }
-                Inst::Class(i) => {
-                    if fc.is_some_and(|ch| class_matches(&program.classes[*i], ch)) {
-                        add_thread(
-                            program,
-                            &mut nlist,
-                            &mut visited,
-                            &mut stack,
-                            pc + 1,
-                            slots,
-                            next_pos,
-                            len,
-                        );
-                    }
-                }
-                Inst::Match => {
+            match step(program, pc, c, fc) {
+                Step::Advance => add_thread(
+                    program,
+                    &mut nlist,
+                    &mut visited,
+                    gen,
+                    &mut stack,
+                    pc + 1,
+                    slots,
+                    next_pos,
+                    len,
+                ),
+                Step::Die => {}
+                Step::Matched => {
                     // Cut every lower-priority thread; higher-priority
                     // threads already queued in nlist survive and may
                     // overwrite this match on a later step.
                     matched = Some(slots);
                     break;
                 }
-                // Epsilon instructions are resolved inside add_thread.
-                Inst::Split { .. }
-                | Inst::Jump(_)
-                | Inst::Save(_)
-                | Inst::StartAnchor
-                | Inst::EndAnchor => unreachable!("epsilon inst in thread list"),
             }
         }
         std::mem::swap(&mut clist, &mut nlist);
@@ -188,7 +192,8 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
 /// Adds a thread to `list`, following epsilon transitions (`Split`, `Jump`,
 /// `Save`, anchors) until consuming instructions are reached.
 ///
-/// `visited` deduplicates by program counter: the first (highest-priority)
+/// `visited` deduplicates by program counter (an entry is claimed when its
+/// stamp equals the current generation): the first (highest-priority)
 /// thread to reach a pc claims it, which both preserves leftmost-first
 /// priority and bounds work per step to one visit per instruction — the
 /// linear-time guarantee. Iterative so pathological epsilon chains cannot
@@ -197,7 +202,8 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
 fn add_thread(
     program: &Program,
     list: &mut Vec<(usize, Slots)>,
-    visited: &mut [bool],
+    visited: &mut [u64],
+    gen: u64,
     stack: &mut Vec<(usize, Slots)>,
     pc: usize,
     slots: Slots,
@@ -207,10 +213,10 @@ fn add_thread(
     debug_assert!(stack.is_empty());
     stack.push((pc, slots));
     while let Some((pc, slots)) = stack.pop() {
-        if visited[pc] {
+        if visited[pc] == gen {
             continue;
         }
-        visited[pc] = true;
+        visited[pc] = gen;
         match &program.insts[pc] {
             Inst::Jump(target) => stack.push((*target, slots)),
             Inst::Split { first, second } => {
@@ -251,9 +257,19 @@ pub fn exec_bool(program: &Program, text: &str) -> bool {
     let len = text.len();
     let mut clist: Vec<usize> = Vec::new();
     let mut nlist: Vec<usize> = Vec::new();
-    let mut visited = vec![false; program.insts.len()];
+    let mut visited = vec![0u64; program.insts.len()];
+    let mut gen = 1u64;
     let mut stack: Vec<usize> = Vec::new();
-    add_thread_bool(program, &mut clist, &mut visited, &mut stack, 0, 0, len);
+    add_thread_bool(
+        program,
+        &mut clist,
+        &mut visited,
+        gen,
+        &mut stack,
+        0,
+        0,
+        len,
+    );
     // Boolean threads are bare pcs, so pc-list equality with the restart
     // state is exact state equality — see the fast-forward note in `exec`.
     let restart: Vec<usize> = clist.clone();
@@ -272,55 +288,22 @@ pub fn exec_bool(program: &Program, text: &str) -> bool {
         let c = text[pos..].chars().next();
         let next_pos = pos + c.map_or(0, char::len_utf8);
         let fc = if program.icase { c.map(fold) } else { c };
-        visited.fill(false);
+        gen += 1;
         nlist.clear();
         for pc in clist.drain(..) {
-            match &program.insts[pc] {
-                Inst::Char(x) => {
-                    if fc == Some(*x) {
-                        add_thread_bool(
-                            program,
-                            &mut nlist,
-                            &mut visited,
-                            &mut stack,
-                            pc + 1,
-                            next_pos,
-                            len,
-                        );
-                    }
-                }
-                Inst::AnyChar => {
-                    if c.is_some() {
-                        add_thread_bool(
-                            program,
-                            &mut nlist,
-                            &mut visited,
-                            &mut stack,
-                            pc + 1,
-                            next_pos,
-                            len,
-                        );
-                    }
-                }
-                Inst::Class(i) => {
-                    if fc.is_some_and(|ch| class_matches(&program.classes[*i], ch)) {
-                        add_thread_bool(
-                            program,
-                            &mut nlist,
-                            &mut visited,
-                            &mut stack,
-                            pc + 1,
-                            next_pos,
-                            len,
-                        );
-                    }
-                }
-                Inst::Match => return true,
-                Inst::Split { .. }
-                | Inst::Jump(_)
-                | Inst::Save(_)
-                | Inst::StartAnchor
-                | Inst::EndAnchor => unreachable!("epsilon inst in thread list"),
+            match step(program, pc, c, fc) {
+                Step::Advance => add_thread_bool(
+                    program,
+                    &mut nlist,
+                    &mut visited,
+                    gen,
+                    &mut stack,
+                    pc + 1,
+                    next_pos,
+                    len,
+                ),
+                Step::Die => {}
+                Step::Matched => return true,
             }
         }
         std::mem::swap(&mut clist, &mut nlist);
@@ -332,10 +315,12 @@ pub fn exec_bool(program: &Program, text: &str) -> bool {
 }
 
 /// [`add_thread`] without slot tracking: `Save` becomes a no-op.
+#[allow(clippy::too_many_arguments)] // internal; mirrors the VM's state
 fn add_thread_bool(
     program: &Program,
     list: &mut Vec<usize>,
-    visited: &mut [bool],
+    visited: &mut [u64],
+    gen: u64,
     stack: &mut Vec<usize>,
     pc: usize,
     pos: usize,
@@ -344,10 +329,10 @@ fn add_thread_bool(
     debug_assert!(stack.is_empty());
     stack.push(pc);
     while let Some(pc) = stack.pop() {
-        if visited[pc] {
+        if visited[pc] == gen {
             continue;
         }
-        visited[pc] = true;
+        visited[pc] = gen;
         match &program.insts[pc] {
             Inst::Jump(target) => stack.push(*target),
             Inst::Split { first, second } => {
@@ -372,6 +357,16 @@ fn add_thread_bool(
     }
 }
 
+/// The mutable state of one POSIX-mode step: per-pc best slot vectors,
+/// generation-stamped so invalidation is O(1) per step, plus the discovery
+/// order of consuming/Match pcs.
+struct PosixStep {
+    best: Vec<Option<Slots>>,
+    best_gen: Vec<u64>,
+    gen: u64,
+    order: Vec<usize>,
+}
+
 /// Executes `program` against `text` as an unanchored, leftmost-longest
 /// (POSIX) search — the v2 opt-in mode behind [`crate::Regex::new_posix`].
 ///
@@ -380,48 +375,42 @@ fn add_thread_bool(
 /// [`posix_better`].
 pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>> {
     let len = text.len();
-    // Best slot vector seen at each pc during the current step's closure;
-    // `order` lists the consuming/Match pcs discovered (each once).
-    let mut best: Vec<Option<Slots>> = vec![None; program.insts.len()];
-    let mut order: Vec<usize> = Vec::new();
+    let mut st = PosixStep {
+        best: vec![None; program.insts.len()],
+        best_gen: vec![0; program.insts.len()],
+        gen: 1,
+        order: Vec::new(),
+    };
     let mut clist: Vec<(usize, Slots)> = Vec::new();
     let mut stack: Vec<(usize, Slots)> = Vec::new();
     let mut best_match: Option<Slots> = None;
 
     let initial = Rc::new(vec![None; program.slot_count]);
-    closure_posix(
-        program, &mut best, &mut order, &mut stack, 0, initial, 0, len,
-    );
-    harvest(&mut best, &mut order, &mut clist);
+    closure_posix(program, &mut st, &mut stack, 0, initial, 0, len);
+    harvest(&mut st, &mut clist);
     // See the fast-forward note in `exec`.
     let restart: Vec<usize> = clist.iter().map(|t| t.0).collect();
 
     let mut pos = 0;
     loop {
         if let Some(want) = program.prefix_char {
-            if best_match.is_none()
-                && clist.len() == restart.len()
-                && clist.iter().map(|t| t.0).eq(restart.iter().copied())
-                && clist
-                    .iter()
-                    .all(|(_, s)| s.iter().flatten().all(|&v| v == pos))
-            {
+            if best_match.is_none() && at_restart(&clist, &restart, pos) {
                 match text[pos..].find(want) {
                     Some(0) => {}
                     Some(off) => {
                         pos += off;
+                        st.gen += 1;
                         clist.clear();
                         closure_posix(
                             program,
-                            &mut best,
-                            &mut order,
+                            &mut st,
                             &mut stack,
                             0,
                             Rc::new(vec![None; program.slot_count]),
                             pos,
                             len,
                         );
-                        harvest(&mut best, &mut order, &mut clist);
+                        harvest(&mut st, &mut clist);
                     }
                     None => break,
                 }
@@ -430,51 +419,17 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
         let c = text[pos..].chars().next();
         let next_pos = pos + c.map_or(0, char::len_utf8);
         let fc = if program.icase { c.map(fold) } else { c };
+        // Closures during this drain run under a fresh generation; a
+        // harvest never shares a generation with a later closure, so a
+        // taken (`None`) entry can never be mistaken for a live claim.
+        st.gen += 1;
         for (pc, slots) in clist.drain(..) {
-            match &program.insts[pc] {
-                Inst::Char(x) => {
-                    if fc == Some(*x) {
-                        closure_posix(
-                            program,
-                            &mut best,
-                            &mut order,
-                            &mut stack,
-                            pc + 1,
-                            slots,
-                            next_pos,
-                            len,
-                        );
-                    }
+            match step(program, pc, c, fc) {
+                Step::Advance => {
+                    closure_posix(program, &mut st, &mut stack, pc + 1, slots, next_pos, len)
                 }
-                Inst::AnyChar => {
-                    if c.is_some() {
-                        closure_posix(
-                            program,
-                            &mut best,
-                            &mut order,
-                            &mut stack,
-                            pc + 1,
-                            slots,
-                            next_pos,
-                            len,
-                        );
-                    }
-                }
-                Inst::Class(i) => {
-                    if fc.is_some_and(|ch| class_matches(&program.classes[*i], ch)) {
-                        closure_posix(
-                            program,
-                            &mut best,
-                            &mut order,
-                            &mut stack,
-                            pc + 1,
-                            slots,
-                            next_pos,
-                            len,
-                        );
-                    }
-                }
-                Inst::Match => {
+                Step::Die => {}
+                Step::Matched => {
                     // (map_or, not is_none_or: MSRV is 1.75.)
                     if best_match
                         .as_ref()
@@ -483,14 +438,9 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
                         best_match = Some(slots);
                     }
                 }
-                Inst::Split { .. }
-                | Inst::Jump(_)
-                | Inst::Save(_)
-                | Inst::StartAnchor
-                | Inst::EndAnchor => unreachable!("epsilon inst in thread list"),
             }
         }
-        harvest(&mut best, &mut order, &mut clist);
+        harvest(&mut st, &mut clist);
         if c.is_none() || clist.is_empty() {
             break;
         }
@@ -507,15 +457,13 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
     })
 }
 
-/// Moves the step's surviving threads out of `best`/`order` into `clist`
-/// and resets `best` for the next step.
-fn harvest(best: &mut [Option<Slots>], order: &mut Vec<usize>, clist: &mut Vec<(usize, Slots)>) {
-    for pc in order.drain(..) {
-        let slots = best[pc].take().expect("ordered pc has best slots");
+/// Moves the step's surviving threads out of `st` into `clist`. Stale
+/// `best` entries are invalidated by the next generation bump — no
+/// O(program) reset here.
+fn harvest(st: &mut PosixStep, clist: &mut Vec<(usize, Slots)>) {
+    for pc in st.order.drain(..) {
+        let slots = st.best[pc].take().expect("ordered pc has best slots");
         clist.push((pc, slots));
-    }
-    for slot in best.iter_mut() {
-        *slot = None;
     }
 }
 
@@ -524,11 +472,9 @@ fn harvest(best: &mut [Option<Slots>], order: &mut Vec<usize>, clist: &mut Vec<(
 /// compare better, re-propagating downstream. Each pc's value strictly
 /// improves on every replacement, so the closure terminates; total work per
 /// step is `O(program^2)` worst case.
-#[allow(clippy::too_many_arguments)] // internal; mirrors the VM's state
 fn closure_posix(
     program: &Program,
-    best: &mut [Option<Slots>],
-    order: &mut Vec<usize>,
+    st: &mut PosixStep,
     stack: &mut Vec<(usize, Slots)>,
     pc: usize,
     slots: Slots,
@@ -538,19 +484,23 @@ fn closure_posix(
     debug_assert!(stack.is_empty());
     stack.push((pc, slots));
     while let Some((pc, slots)) = stack.pop() {
-        match &best[pc] {
-            Some(cur) if !posix_better(program, &slots, cur) => continue,
-            Some(_) => {}
-            None => {
-                if matches!(
-                    program.insts[pc],
-                    Inst::Char(_) | Inst::AnyChar | Inst::Class(_) | Inst::Match
-                ) {
-                    order.push(pc);
-                }
+        if st.best_gen[pc] == st.gen {
+            // Claimed this step: replace only if strictly better.
+            match &st.best[pc] {
+                Some(cur) if !posix_better(program, &slots, cur) => continue,
+                _ => {}
+            }
+        } else {
+            // First claim this step.
+            st.best_gen[pc] = st.gen;
+            if matches!(
+                program.insts[pc],
+                Inst::Char(_) | Inst::AnyChar | Inst::Class(_) | Inst::Match
+            ) {
+                st.order.push(pc);
             }
         }
-        best[pc] = Some(slots.clone());
+        st.best[pc] = Some(slots.clone());
         match &program.insts[pc] {
             Inst::Jump(target) => stack.push((*target, slots)),
             Inst::Split { first, second } => {

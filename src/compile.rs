@@ -99,9 +99,8 @@ pub fn fold(c: char) -> char {
 /// `=~` semantics. Anchored programs omit the prefix entirely: their
 /// thread list empties as soon as position 0 fails, so `^b` against a
 /// megabyte of text stops after one character instead of scanning it all.
-pub fn compile(ast: &Ast, icase: bool) -> Result<Program, Error> {
-    let group_count = max_group(ast) as usize + 1;
-    let mut ast = ast.clone();
+pub fn compile(mut ast: Ast, icase: bool) -> Result<Program, Error> {
+    let group_count = max_group(&ast) as usize + 1;
     let mut tag_order = vec![0];
     let mut next_slot = 2 * group_count;
     number(&mut ast, &mut next_slot, &mut tag_order);

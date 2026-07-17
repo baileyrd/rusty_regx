@@ -127,7 +127,7 @@ impl Regex {
 
     fn compile(pattern: &str, posix: bool, icase: bool) -> Result<Regex, Error> {
         let ast = parser::parse(pattern)?;
-        let program = compile::compile(&ast, icase)?;
+        let program = compile::compile(ast, icase)?;
         Ok(Regex {
             pattern: pattern.into(),
             program,
