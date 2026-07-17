@@ -22,7 +22,7 @@
 //! group in index order — the classic leftmost-longest approximation used
 //! by RE2's POSIX mode, matching what bash/glibc report.
 
-use crate::compile::{fold, Inst, Literal, LookaroundProg, Program};
+use crate::compile::{fold, Inst, Literal, LookaroundProg, Program, SimpleLookaround};
 use std::rc::Rc;
 
 /// Byte offsets recorded by `Save`; two slots per group.
@@ -180,16 +180,53 @@ fn nth_char_boundary_back(text: &str, pos: usize, n: usize) -> Option<usize> {
 /// `docs/LOOKAROUND.md` for the performance discussion this is meant to
 /// let the benchmarks surface.
 fn lookaround_holds(la: &LookaroundProg, text: &str, pos: usize) -> bool {
-    let mut sub_scratch = Scratch::default();
-    let matched = if la.ahead {
-        exec_bool(&la.program, text, pos, &mut sub_scratch)
+    let matched = if let Some(simple) = &la.simple {
+        simple_lookaround_holds(la, simple, text, pos)
     } else {
-        match nth_char_boundary_back(text, pos, la.len) {
-            Some(start) => exec_bool(&la.program, text, start, &mut sub_scratch),
-            None => false,
+        let program = la
+            .program
+            .as_ref()
+            .expect("simple lookaround always has a fallback program when simple is None");
+        let mut sub_scratch = Scratch::default();
+        if la.ahead {
+            exec_bool(program, text, pos, &mut sub_scratch)
+        } else {
+            match nth_char_boundary_back(text, pos, la.len) {
+                Some(start) => exec_bool(program, text, start, &mut sub_scratch),
+                None => false,
+            }
         }
     };
     matched != la.negative
+}
+
+/// The fast path for a single-atom lookaround body (see
+/// [`LookaroundProg::simple`]): checks the one adjacent char directly —
+/// the char at `pos` itself for lookahead, the char immediately before
+/// `pos` for lookbehind — with no nested VM invocation at all.
+fn simple_lookaround_holds(
+    la: &LookaroundProg,
+    simple: &SimpleLookaround,
+    text: &str,
+    pos: usize,
+) -> bool {
+    let c = if la.ahead {
+        text[pos..].chars().next()
+    } else {
+        text[..pos].chars().next_back()
+    };
+    let Some(c) = c else { return false };
+    match simple {
+        SimpleLookaround::Char(want) => {
+            let fc = if la.icase { fold(c) } else { c };
+            fc == *want
+        }
+        SimpleLookaround::AnyChar => !(la.newline && c == '\n'),
+        SimpleLookaround::Class(class) => {
+            let fc = if la.icase { fold(c) } else { c };
+            class.matches(fc)
+        }
+    }
 }
 
 /// Whether `hay`, case-folded char by char, begins with pre-folded `needle`.

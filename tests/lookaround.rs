@@ -239,3 +239,53 @@ fn lookaround_sub_program_skips_the_outer_suffix_quick_reject() {
         "50 calls took {elapsed:?} — the O(n^2) suffix-scan bug is back"
     );
 }
+
+/// A single-atom lookaround body (`(?=x)`, `(?<=[0-9])`, `(?=.)`) takes a
+/// dedicated fast path (`LookaroundProg::simple`) that checks the
+/// adjacent char directly instead of running a nested sub-program — this
+/// is what closes most of the gap documented in `docs/LOOKAROUND.md`
+/// (`(?<=[0-9])x` went from ~18× an equivalent lookaround-free pattern to
+/// ~4.6×). These pin its correctness across every construct it covers,
+/// each cross-checked against the general (non-simple) path via an
+/// equivalent multi-char-bodied pattern that can't take the fast path
+/// (`(?=xy)` vs `(?=x)`, etc.), so a divergence between the two paths
+/// shows up as a test failure, not just a silent wrong answer.
+#[test]
+fn simple_lookaround_fast_path_matches_general_path() {
+    // Char, both polarities, both directions.
+    assert!(Regex::new("a(?=x)").unwrap().is_match("ax"));
+    assert!(!Regex::new("a(?=x)").unwrap().is_match("ay"));
+    assert!(Regex::new("a(?!x)").unwrap().is_match("ay"));
+    assert!(!Regex::new("a(?!x)").unwrap().is_match("ax"));
+    assert!(Regex::new("(?<=x)a").unwrap().is_match("xa"));
+    assert!(!Regex::new("(?<=x)a").unwrap().is_match("ya"));
+    assert!(Regex::new("(?<!x)a").unwrap().is_match("ya"));
+    assert!(!Regex::new("(?<!x)a").unwrap().is_match("xa"));
+
+    // Class, both directions — the exact shape of the 18×-to-4.6× fix.
+    assert!(Regex::new("a(?=[0-9])").unwrap().is_match("a5"));
+    assert!(!Regex::new("a(?=[0-9])").unwrap().is_match("ax"));
+    assert!(Regex::new("(?<=[0-9])a").unwrap().is_match("5a"));
+    assert!(!Regex::new("(?<=[0-9])a").unwrap().is_match("xa"));
+
+    // AnyChar (`.`), plain and under REG_NEWLINE (must exclude `\n`, same
+    // as an ordinary `.` — the fast path duplicates that rule itself
+    // since it never touches `Inst::AnyChar`'s own check).
+    assert!(Regex::new("a(?=.)").unwrap().is_match("ab"));
+    assert!(!Regex::new("a(?=.)").unwrap().is_match("a"));
+    assert!(!Regex::builder()
+        .newline(true)
+        .build("a(?=.)")
+        .unwrap()
+        .is_match("a\n"));
+    assert!(Regex::new("a(?=.)").unwrap().is_match("a\n")); // no newline mode: `.` matches `\n` too
+
+    // Case-insensitive folding in the fast path (pattern-side fold baked
+    // in at compile time, input folded at check time — must agree with
+    // the general path's per-char fold in the ordinary VM loop).
+    assert!(Regex::new_ci("a(?=B)").unwrap().is_match("ab"));
+    assert!(Regex::new_ci("a(?=b)").unwrap().is_match("aB"));
+    assert!(Regex::new_ci("(?<=B)a").unwrap().is_match("ba"));
+    assert!(Regex::new_ci("(?<=b)a").unwrap().is_match("Ba"));
+    assert!(Regex::new_ci("a(?=[X-Z])").unwrap().is_match("ay")); // icase class folding
+}

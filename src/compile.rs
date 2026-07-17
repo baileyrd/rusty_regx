@@ -86,9 +86,66 @@ pub struct LookaroundProg {
     pub negative: bool,
     /// For lookbehind only: the exact number of chars the body consumes
     /// (validated fixed-length at parse time — see
-    /// [`crate::compile::fixed_len`]). Unused (0) for lookahead.
+    /// [`crate::compile::fixed_len`]). Unused (0) for lookahead; 1 when
+    /// `simple` applies.
     pub len: usize,
-    pub program: Program,
+    pub icase: bool,
+    pub newline: bool,
+    /// Fast path for a single-atom body — `(?=x)`, `(?<=[0-9])`, `(?=.)`
+    /// — checked directly against the one adjacent char with no nested
+    /// VM invocation at all: no `Scratch` allocation, no `exec_bool`
+    /// call, just a char comparison. `None` falls back to `program`.
+    /// This closes most of the gap documented in `docs/LOOKAROUND.md`
+    /// between a lookaround assertion and the equivalent consuming
+    /// pattern, for the common case of asserting a single class or
+    /// literal char (e.g. `(?<=[0-9])x` gating a digit check).
+    pub simple: Option<SimpleLookaround>,
+    /// The general fallback: a fully compiled, independent sub-program,
+    /// used whenever `simple` doesn't apply (multi-char bodies,
+    /// alternation, nested lookaround, `Empty`, and so on).
+    pub program: Option<Program>,
+}
+
+/// The single-atom bodies [`LookaroundProg::simple`] can check directly.
+/// Pattern-side folding (case, and the `REG_NEWLINE` `.`-excludes-`\n`
+/// rule) is baked in at compile time, same as the ordinary `Inst::Char`/
+/// `Inst::AnyChar`/`Inst::Class` instructions.
+#[derive(Debug, Clone)]
+pub enum SimpleLookaround {
+    /// Already folded if `icase`.
+    Char(char),
+    /// `.` — excludes `\n` when `LookaroundProg::newline` is set (checked
+    /// by the caller, which knows the raw, unfolded char).
+    AnyChar,
+    /// Already folded (and `\n`-excluding, if negated under
+    /// `REG_NEWLINE`) — an ordinary compiled class.
+    Class(CompiledClass),
+}
+
+/// If `ast` is a single atom (`Char`, `AnyChar`, or `Class` — exactly a
+/// lookaround body of fixed length 1 with no internal structure), returns
+/// the fast-path check for it. `Ast::Concat` never reaches here with a
+/// single item (the parser collapses those), and groups inside a
+/// lookaround are already unwrapped to plain grouping by the parser, so
+/// this only needs to handle genuine leaves.
+fn simple_lookaround(
+    ast: &Ast,
+    icase: bool,
+    newline: bool,
+) -> Result<Option<SimpleLookaround>, Error> {
+    Ok(match ast {
+        Ast::Char(c) => Some(SimpleLookaround::Char(if icase { fold(*c) } else { *c })),
+        Ast::AnyChar => Some(SimpleLookaround::AnyChar),
+        Ast::Class(class) => {
+            let mut folded = fold_class(class, icase)?;
+            if newline && folded.negated {
+                folded.ranges.push(('\n', '\n'));
+            }
+            normalize_ranges(&mut folded.ranges);
+            Some(SimpleLookaround::Class(CompiledClass::new(folded)))
+        }
+        _ => None,
+    })
 }
 
 /// A compiled bracket expression: ASCII membership precomputed as a
@@ -894,24 +951,36 @@ impl Compiler {
                 negative,
                 inner,
             } => {
-                // A fresh, independently-numbered sub-program: see
+                // The fast path: a single-atom body needs no nested VM at
+                // all, just a direct char comparison (see
+                // `LookaroundProg::simple`). Everything else falls back
+                // to a fresh, independently-numbered sub-program — see
                 // `compile_impl`'s `force_anchored` — it must check "does
                 // this match right here", never search ahead. Lookbehind's
                 // fixed length is a parser-time invariant (`special_group`
                 // rejects variable-length bodies), so the `expect` here
                 // can't fail for any `Ast` the parser produces.
-                let sub = compile_impl((**inner).clone(), self.icase, self.newline, true)?;
-                let len = if *ahead {
-                    0
+                let simple = simple_lookaround(inner, self.icase, self.newline)?;
+                let (len, program) = if simple.is_some() {
+                    (if *ahead { 0 } else { 1 }, None)
                 } else {
-                    fixed_len(inner).expect("parser rejects variable-length lookbehind")
+                    let sub = compile_impl((**inner).clone(), self.icase, self.newline, true)?;
+                    let len = if *ahead {
+                        0
+                    } else {
+                        fixed_len(inner).expect("parser rejects variable-length lookbehind")
+                    };
+                    (len, Some(sub))
                 };
                 let index = self.lookarounds.len();
                 self.lookarounds.push(LookaroundProg {
                     ahead: *ahead,
                     negative: *negative,
                     len,
-                    program: sub,
+                    icase: self.icase,
+                    newline: self.newline,
+                    simple,
+                    program,
                 });
                 self.push(if *ahead {
                     Inst::Lookahead(index)
