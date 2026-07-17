@@ -382,6 +382,76 @@ fn find_agrees_with_captures_span_in_every_mode() {
     );
 }
 
+/// Iteration semantics: non-overlapping, leftmost, empty matches
+/// advance one char. The regex crate is the oracle where the engines'
+/// semantics coincide (leftmost-first, no by-design divergent syntax).
+#[test]
+fn find_iter_agrees_with_regex_crate() {
+    let cases = [
+        ("a+", "aa b aaa"),
+        ("a*", "aab"),
+        ("", "é a"),
+        ("ab", "ababab"),
+        ("[0-9]+", "1 22 333"),
+        ("a", "zzz"),
+        ("(a)(b)?", "ab a ab"),
+    ];
+    for (pattern, text) in cases {
+        let ours: Vec<(usize, usize)> = Regex::new(pattern)
+            .unwrap()
+            .find_iter(text)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        let theirs: Vec<(usize, usize)> = regex::Regex::new(pattern)
+            .unwrap()
+            .find_iter(text)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        assert_eq!(
+            ours, theirs,
+            "find_iter divergence on {pattern:?} / {text:?}"
+        );
+    }
+}
+
+#[test]
+fn iteration_semantics() {
+    // Anchors keep absolute meaning across restarts: ^ matches only the
+    // true start, $ only the true end.
+    let spans = |p: &str, t: &str| -> Vec<(usize, usize)> {
+        Regex::new(p)
+            .unwrap()
+            .find_iter(t)
+            .map(|m| (m.start(), m.end()))
+            .collect()
+    };
+    assert_eq!(spans("^a", "aaa"), vec![(0, 1)]);
+    assert_eq!(spans("a$", "aaa"), vec![(2, 3)]);
+    assert_eq!(spans("^a+$", "aaa"), vec![(0, 3)]);
+    // Empty-match advance is char-based, never splitting a multibyte char.
+    assert_eq!(spans("x*", "éé"), vec![(0, 0), (2, 2), (4, 4)]);
+    // POSIX mode: each match is leftmost-longest.
+    let posix: Vec<&str> = Regex::new_posix("a|ab")
+        .unwrap()
+        .find_iter("ab ab")
+        .map(|m| m.as_str())
+        .collect();
+    assert_eq!(posix, vec!["ab", "ab"]);
+    // captures_iter carries per-match groups.
+    let caps: Vec<(Option<String>, Option<String>)> = Regex::new("(a)(b)?")
+        .unwrap()
+        .captures_iter("ab a")
+        .map(|c| (c.get(1).map(String::from), c.get(2).map(String::from)))
+        .collect();
+    assert_eq!(
+        caps,
+        vec![
+            (Some("a".into()), Some("b".into())),
+            (Some("a".into()), None)
+        ]
+    );
+}
+
 #[test]
 fn group_count_and_from_str() {
     assert_eq!(Regex::new("abc").unwrap().group_count(), 1);

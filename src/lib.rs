@@ -147,7 +147,7 @@ impl Regex {
     /// depend on the match semantics, so this is the same single fast path
     /// in every mode (including POSIX).
     pub fn is_match(&self, text: &str) -> bool {
-        vm::exec_bool(&self.program, text)
+        vm::exec_bool(&self.program, text, 0, &mut vm::Scratch::default())
     }
 
     /// Searches `text` for the leftmost match, returning the capture groups.
@@ -155,12 +155,66 @@ impl Regex {
     /// Group 0 is always the whole match. Groups that did not participate in
     /// the match report as absent via [`Captures::get`].
     pub fn captures<'t>(&self, text: &'t str) -> Option<Captures<'t>> {
+        self.captures_at(text, 0, &mut vm::Scratch::default())
+    }
+
+    fn captures_at<'t>(
+        &self,
+        text: &'t str,
+        from: usize,
+        scratch: &mut vm::Scratch,
+    ) -> Option<Captures<'t>> {
         let slots = if self.posix {
-            vm::exec_posix(&self.program, text, self.program.slot_count)
+            vm::exec_posix(&self.program, text, self.program.slot_count, from, scratch)
         } else {
-            vm::exec(&self.program, text, self.program.slot_count)
+            vm::exec(&self.program, text, self.program.slot_count, from, scratch)
         };
         slots.map(|slots| Captures { text, slots })
+    }
+
+    fn find_at<'t>(
+        &self,
+        text: &'t str,
+        from: usize,
+        scratch: &mut vm::Scratch,
+    ) -> Option<Match<'t>> {
+        let slots = if self.posix {
+            vm::exec_posix(&self.program, text, 2, from, scratch)
+        } else {
+            vm::exec(&self.program, text, 2, from, scratch)
+        };
+        slots
+            .and_then(|slots| slots.first().copied().flatten())
+            .map(|(start, end)| Match { text, start, end })
+    }
+
+    /// Iterates over all non-overlapping matches in `text`, leftmost
+    /// first (leftmost-longest per match in the POSIX modes).
+    ///
+    /// Empty-match handling matches the `regex` crate: after a match the
+    /// search resumes at its end; an empty match advances one `char`, and
+    /// an empty match starting exactly where the previous match ended is
+    /// skipped — so `a*` over `"aab"` yields `"aa"` then `""` at the end,
+    /// never a zero-width match glued to `"aa"`.
+    pub fn find_iter<'r, 't>(&'r self, text: &'t str) -> FindIter<'r, 't> {
+        FindIter {
+            re: self,
+            text,
+            at: 0,
+            last_match: None,
+            scratch: vm::Scratch::default(),
+        }
+    }
+
+    /// As [`Regex::find_iter`], yielding full [`Captures`] per match.
+    pub fn captures_iter<'r, 't>(&'r self, text: &'t str) -> CapturesIter<'r, 't> {
+        CapturesIter {
+            re: self,
+            text,
+            at: 0,
+            last_match: None,
+            scratch: vm::Scratch::default(),
+        }
     }
 
     /// Searches `text` for the leftmost match, returning only its
@@ -172,14 +226,7 @@ impl Regex {
     /// report as group 0 (in every mode — POSIX leftmost-longest
     /// disambiguates group 0 by its own span first).
     pub fn find<'t>(&self, text: &'t str) -> Option<Match<'t>> {
-        let slots = if self.posix {
-            vm::exec_posix(&self.program, text, 2)
-        } else {
-            vm::exec(&self.program, text, 2)
-        };
-        slots
-            .and_then(|slots| slots.first().copied().flatten())
-            .map(|(start, end)| Match { text, start, end })
+        self.find_at(text, 0, &mut vm::Scratch::default())
     }
 
     /// The number of capture groups this pattern has, including group 0
@@ -227,6 +274,98 @@ impl<'t> Match<'t> {
     /// The matched text.
     pub fn as_str(&self) -> &'t str {
         &self.text[self.start..self.end]
+    }
+}
+
+/// The shared iteration step (the `regex` crate's rule): resume at the
+/// match's end; an empty match advances one `char` and is *skipped*
+/// entirely when it starts exactly where the previous match ended.
+/// Returns the span to yield, updating `at`/`last_match`.
+fn iter_step(
+    re: &Regex,
+    text: &str,
+    at: &mut usize,
+    last_match: &mut Option<usize>,
+    scratch: &mut vm::Scratch,
+) -> Option<(usize, usize)> {
+    loop {
+        if *at > text.len() {
+            return None;
+        }
+        let m = re.find_at(text, *at, scratch)?;
+        let (start, end) = (m.start, m.end);
+        if start == end {
+            // Advance one char past the empty match (never splitting one).
+            *at = if end >= text.len() {
+                text.len() + 1
+            } else {
+                end + text[end..].chars().next().map_or(1, char::len_utf8)
+            };
+            if Some(end) == *last_match {
+                continue;
+            }
+        } else {
+            *at = end;
+        }
+        *last_match = Some(end);
+        return Some((start, end));
+    }
+}
+
+/// An iterator over all non-overlapping matches (see
+/// [`Regex::find_iter`]). VM working buffers are reused across matches.
+pub struct FindIter<'r, 't> {
+    re: &'r Regex,
+    text: &'t str,
+    at: usize,
+    last_match: Option<usize>,
+    scratch: vm::Scratch,
+}
+
+impl<'t> Iterator for FindIter<'_, 't> {
+    type Item = Match<'t>;
+
+    fn next(&mut self) -> Option<Match<'t>> {
+        let (start, end) = iter_step(
+            self.re,
+            self.text,
+            &mut self.at,
+            &mut self.last_match,
+            &mut self.scratch,
+        )?;
+        Some(Match {
+            text: self.text,
+            start,
+            end,
+        })
+    }
+}
+
+/// An iterator over all non-overlapping matches with full captures (see
+/// [`Regex::captures_iter`]).
+pub struct CapturesIter<'r, 't> {
+    re: &'r Regex,
+    text: &'t str,
+    at: usize,
+    last_match: Option<usize>,
+    scratch: vm::Scratch,
+}
+
+impl<'t> Iterator for CapturesIter<'_, 't> {
+    type Item = Captures<'t>;
+
+    fn next(&mut self) -> Option<Captures<'t>> {
+        // Locate via the cheap group-0 path (including the crate's
+        // empty-match rule), then run full captures anchored at the
+        // match we already found.
+        let (start, _) = iter_step(
+            self.re,
+            self.text,
+            &mut self.at,
+            &mut self.last_match,
+            &mut self.scratch,
+        )?;
+        self.re.captures_at(self.text, start, &mut self.scratch)
     }
 }
 

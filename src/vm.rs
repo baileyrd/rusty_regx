@@ -37,13 +37,15 @@ type Slots = Rc<Vec<Option<usize>>>;
 /// [`Program::literal`]): the leftmost match's byte span, or `None`.
 /// Leftmost-first and POSIX agree here — a literal has exactly one
 /// possible span per start position.
-fn literal_span(lit: &Literal, text: &str) -> Option<(usize, usize)> {
+fn literal_span(lit: &Literal, text: &str, from: usize) -> Option<(usize, usize)> {
     let n = lit.s.len();
     match (lit.anchored_start, lit.anchored_end) {
-        (true, true) => (text == lit.s).then_some((0, n)),
-        (true, false) => text.starts_with(&lit.s).then_some((0, n)),
-        (false, true) => text.ends_with(&lit.s).then(|| (text.len() - n, text.len())),
-        (false, false) => text.find(&lit.s).map(|i| (i, i + n)),
+        // `^`-anchored: only reachable when the search starts at 0.
+        (true, true) => (from == 0 && text == lit.s).then_some((0, n)),
+        (true, false) => (from == 0 && text.starts_with(&lit.s)).then_some((0, n)),
+        (false, true) => (text.len() >= n && text.len() - n >= from && text.ends_with(&lit.s))
+            .then(|| (text.len() - n, text.len())),
+        (false, false) => text[from..].find(&lit.s).map(|i| (from + i, from + i + n)),
     }
 }
 
@@ -78,14 +80,15 @@ fn find_prefix(program: &Program, hay: &str) -> Option<usize> {
 /// `program.suffix`, so text that doesn't contain it (or doesn't end
 /// with it, for `\$`-anchored patterns) can't match — one substring
 /// scan instead of a full NFA simulation.
-fn suffix_rejects(program: &Program, text: &str) -> bool {
+fn suffix_rejects(program: &Program, text: &str, from: usize) -> bool {
     if program.suffix.is_empty() {
         return false;
     }
+    // The suffix must lie within the searched region [from..].
     if program.suffix_anchored {
-        !text.ends_with(&program.suffix)
+        !text[from..].ends_with(&program.suffix)
     } else {
-        !text.contains(&program.suffix)
+        !text[from..].contains(&program.suffix)
     }
 }
 
@@ -129,8 +132,40 @@ fn at_restart(clist: &[(usize, Slots)], restart: &[usize], pos: usize) -> bool {
             .all(|(_, s)| s.iter().flatten().all(|&v| v == pos))
 }
 
+/// Reusable VM working state. The one-shot entry points build one per
+/// call; the iteration APIs reuse one across restarts so buffer capacity
+/// is amortized over all matches. Generations are monotonic within a
+/// `Scratch`, so stale visited/best stamps can never collide across
+/// reuses; thread lists are cleared at each entry.
+#[derive(Default)]
+pub struct Scratch {
+    clist: Vec<(usize, Slots)>,
+    nlist: Vec<(usize, Slots)>,
+    stack: Vec<(usize, Slots)>,
+    bclist: Vec<usize>,
+    bnlist: Vec<usize>,
+    bstack: Vec<usize>,
+    visited: Vec<u64>,
+    best: Vec<Option<Slots>>,
+    best_gen: Vec<u64>,
+    order: Vec<usize>,
+    gen: u64,
+}
+
+impl Scratch {
+    fn ensure(&mut self, n: usize) {
+        if self.visited.len() < n {
+            self.visited.resize(n, 0);
+            self.best.resize(n, None);
+            self.best_gen.resize(n, 0);
+        }
+    }
+}
+
 /// Executes `program` against `text` as an unanchored, leftmost-first
-/// search.
+/// search starting at byte offset `from` (a `char` boundary). Anchors
+/// keep their absolute meaning: `^` still asserts position 0, not
+/// `from` — which is what makes the iteration APIs correct.
 ///
 /// On a match, returns one `(start, end)` byte-offset pair per capture
 /// group (group 0 first); groups that did not participate are `None`.
@@ -142,62 +177,58 @@ pub fn exec(
     program: &Program,
     text: &str,
     slot_limit: usize,
+    from: usize,
+    scratch: &mut Scratch,
 ) -> Option<Vec<Option<(usize, usize)>>> {
     if let Some(lit) = &program.literal {
         // A literal pattern has no groups: group 0 is the only capture.
-        return literal_span(lit, text).map(|span| vec![Some(span)]);
+        return literal_span(lit, text, from).map(|span| vec![Some(span)]);
     }
-    if suffix_rejects(program, text) {
+    if suffix_rejects(program, text, from) {
         return None;
     }
     let len = text.len();
-    let mut clist: Vec<(usize, Slots)> = Vec::new();
-    let mut nlist: Vec<(usize, Slots)> = Vec::new();
-    // Generation-stamped visited set: bumping `gen` invalidates every
-    // entry in O(1) instead of an O(program) clear per input char.
-    let mut visited = vec![0u64; program.insts.len()];
-    let mut gen = 1u64;
-    // Reused across every add_thread call; always drained back to empty.
-    let mut stack: Vec<(usize, Slots)> = Vec::new();
+    scratch.ensure(program.insts.len());
+    let Scratch {
+        clist,
+        nlist,
+        stack,
+        visited,
+        gen,
+        ..
+    } = scratch;
+    clist.clear();
+    nlist.clear();
+    *gen += 1;
     let mut matched: Option<Slots> = None;
 
     let initial = Rc::new(vec![None; slot_limit.min(program.slot_count)]);
-    add_thread(
-        program,
-        &mut clist,
-        &mut visited,
-        gen,
-        &mut stack,
-        0,
-        initial,
-        0,
-        len,
-    );
+    add_thread(program, clist, visited, *gen, stack, 0, initial, from, len);
     // The thread state a scan (re)starts from; used by the fast-forward
-    // check below. Captured at position 0, which never fires for patterns
-    // with an anchored head branch (their restart set shrinks after 0) —
-    // that is safe, just unaccelerated.
+    // check below. Captured at `from`: for `from == 0`, a pattern with an
+    // anchored head branch shrinks its restart set afterwards, so the
+    // check never fires (safe, just unaccelerated); for `from > 0` the
+    // anchored heads are already gone and it fires normally.
     let restart: Vec<usize> = clist.iter().map(|t| t.0).collect();
 
-    let mut pos = 0;
+    let mut pos = from;
     loop {
-        // Fast-forward: when the pattern requires a literal first char and
-        // no live thread carries progress (see `at_restart`), nothing can
-        // match before the next occurrence of that char — skip straight
-        // to it.
-        if !program.prefix.is_empty() && matched.is_none() && at_restart(&clist, &restart, pos) {
+        // Fast-forward: when the pattern requires a literal prefix and no
+        // live thread carries progress (see `at_restart`), nothing can
+        // match before the prefix's next occurrence — skip straight to it.
+        if !program.prefix.is_empty() && matched.is_none() && at_restart(clist, &restart, pos) {
             match find_prefix(program, &text[pos..]) {
                 Some(0) => {}
                 Some(off) => {
                     pos += off;
-                    gen += 1;
+                    *gen += 1;
                     clist.clear();
                     add_thread(
                         program,
-                        &mut clist,
-                        &mut visited,
-                        gen,
-                        &mut stack,
+                        clist,
+                        visited,
+                        *gen,
+                        stack,
                         0,
                         Rc::new(vec![None; slot_limit.min(program.slot_count)]),
                         pos,
@@ -213,16 +244,16 @@ pub fn exec(
         // The pattern side was folded at compile time; fold the input to
         // match. Positions (and so captures) always use the original text.
         let fc = if program.icase { c.map(fold) } else { c };
-        gen += 1;
+        *gen += 1;
         nlist.clear();
         for (pc, slots) in clist.drain(..) {
             match step(program, pc, c, fc) {
                 Step::Advance => add_thread(
                     program,
-                    &mut nlist,
-                    &mut visited,
-                    gen,
-                    &mut stack,
+                    nlist,
+                    visited,
+                    *gen,
+                    stack,
                     pc + 1,
                     slots,
                     next_pos,
@@ -238,7 +269,7 @@ pub fn exec(
                 }
             }
         }
-        std::mem::swap(&mut clist, &mut nlist);
+        std::mem::swap(clist, nlist);
         if c.is_none() || clist.is_empty() {
             break;
         }
@@ -315,42 +346,41 @@ fn add_thread(
     }
 }
 
-/// Executes `program` against `text` as a pure boolean test.
+/// Executes `program` against `text` as a pure boolean test, starting at
+/// byte offset `from` (see [`exec`] for anchor semantics).
 ///
 /// No capture tracking: threads are bare program counters, so `Split`
 /// costs O(1) instead of cloning a slot vector. Match *existence* is
 /// identical across leftmost-first and POSIX semantics (both are "does
 /// any match exist?"), so this single path serves every mode.
-pub fn exec_bool(program: &Program, text: &str) -> bool {
+pub fn exec_bool(program: &Program, text: &str, from: usize, scratch: &mut Scratch) -> bool {
     if let Some(lit) = &program.literal {
-        return literal_span(lit, text).is_some();
+        return literal_span(lit, text, from).is_some();
     }
-    if suffix_rejects(program, text) {
+    if suffix_rejects(program, text, from) {
         return false;
     }
     let len = text.len();
-    let mut clist: Vec<usize> = Vec::new();
-    let mut nlist: Vec<usize> = Vec::new();
-    let mut visited = vec![0u64; program.insts.len()];
-    let mut gen = 1u64;
-    let mut stack: Vec<usize> = Vec::new();
-    add_thread_bool(
-        program,
-        &mut clist,
-        &mut visited,
+    scratch.ensure(program.insts.len());
+    let Scratch {
+        bclist: clist,
+        bnlist: nlist,
+        bstack: stack,
+        visited,
         gen,
-        &mut stack,
-        0,
-        0,
-        len,
-    );
+        ..
+    } = scratch;
+    clist.clear();
+    nlist.clear();
+    *gen += 1;
+    add_thread_bool(program, clist, visited, *gen, stack, 0, from, len);
     // Boolean threads are bare pcs, so pc-list equality with the restart
     // state is exact state equality — see the fast-forward note in `exec`.
     let restart: Vec<usize> = clist.clone();
 
-    let mut pos = 0;
+    let mut pos = from;
     loop {
-        if !program.prefix.is_empty() && clist == restart {
+        if !program.prefix.is_empty() && *clist == restart {
             match find_prefix(program, &text[pos..]) {
                 Some(0) => {}
                 Some(off) => pos += off,
@@ -360,25 +390,18 @@ pub fn exec_bool(program: &Program, text: &str) -> bool {
         let c = text[pos..].chars().next();
         let next_pos = pos + c.map_or(0, char::len_utf8);
         let fc = if program.icase { c.map(fold) } else { c };
-        gen += 1;
+        *gen += 1;
         nlist.clear();
         for pc in clist.drain(..) {
             match step(program, pc, c, fc) {
-                Step::Advance => add_thread_bool(
-                    program,
-                    &mut nlist,
-                    &mut visited,
-                    gen,
-                    &mut stack,
-                    pc + 1,
-                    next_pos,
-                    len,
-                ),
+                Step::Advance => {
+                    add_thread_bool(program, nlist, visited, *gen, stack, pc + 1, next_pos, len)
+                }
                 Step::Die => {}
                 Step::Matched => return true,
             }
         }
-        std::mem::swap(&mut clist, &mut nlist);
+        std::mem::swap(clist, nlist);
         if c.is_none() || clist.is_empty() {
             return false;
         }
@@ -429,74 +452,73 @@ fn add_thread_bool(
     }
 }
 
-/// The mutable state of one POSIX-mode step: per-pc best slot vectors,
-/// generation-stamped so invalidation is O(1) per step, plus the discovery
-/// order of consuming/Match pcs.
-struct PosixStep {
-    best: Vec<Option<Slots>>,
-    best_gen: Vec<u64>,
-    gen: u64,
-    order: Vec<usize>,
-}
-
 /// Executes `program` against `text` as an unanchored, leftmost-longest
-/// (POSIX) search — the v2 opt-in mode behind [`crate::Regex::new_posix`].
+/// (POSIX) search starting at byte offset `from` — the v2 opt-in mode
+/// behind [`crate::Regex::new_posix`].
 ///
 /// Same return contract as [`exec`]. Instead of cutting on `Match`, every
 /// candidate runs to completion and the best capture vector wins under
 /// [`posix_better`].
-/// See [`exec`] for `slot_limit`. Group-0-only tracking stays correct
-/// here: truncated vectors compare on the group-0 pair alone, which is
-/// exactly overall leftmost-longest, and ties keep the incumbent — same
-/// group-0 span either way.
 pub fn exec_posix(
     program: &Program,
     text: &str,
     slot_limit: usize,
+    from: usize,
+    scratch: &mut Scratch,
 ) -> Option<Vec<Option<(usize, usize)>>> {
     if let Some(lit) = &program.literal {
         // Fixed-length literal: leftmost-first and leftmost-longest agree.
-        return literal_span(lit, text).map(|span| vec![Some(span)]);
+        return literal_span(lit, text, from).map(|span| vec![Some(span)]);
     }
-    if suffix_rejects(program, text) {
+    if suffix_rejects(program, text, from) {
         return None;
     }
     let len = text.len();
-    let mut st = PosixStep {
-        best: vec![None; program.insts.len()],
-        best_gen: vec![0; program.insts.len()],
-        gen: 1,
-        order: Vec::new(),
-    };
-    let mut clist: Vec<(usize, Slots)> = Vec::new();
-    let mut stack: Vec<(usize, Slots)> = Vec::new();
+    scratch.ensure(program.insts.len());
+    let Scratch {
+        clist,
+        stack,
+        best,
+        best_gen,
+        order,
+        gen,
+        ..
+    } = scratch;
+    clist.clear();
+    order.clear();
+    *gen += 1;
     let mut best_match: Option<Slots> = None;
 
     let initial = Rc::new(vec![None; slot_limit.min(program.slot_count)]);
-    closure_posix(program, &mut st, &mut stack, 0, initial, 0, len);
-    harvest(&mut st, &mut clist);
+    closure_posix(
+        program, best, best_gen, *gen, order, stack, 0, initial, from, len,
+    );
+    harvest(best, order, clist);
     // See the fast-forward note in `exec`.
     let restart: Vec<usize> = clist.iter().map(|t| t.0).collect();
 
-    let mut pos = 0;
+    let mut pos = from;
     loop {
-        if !program.prefix.is_empty() && best_match.is_none() && at_restart(&clist, &restart, pos) {
+        if !program.prefix.is_empty() && best_match.is_none() && at_restart(clist, &restart, pos) {
             match find_prefix(program, &text[pos..]) {
                 Some(0) => {}
                 Some(off) => {
                     pos += off;
-                    st.gen += 1;
+                    *gen += 1;
                     clist.clear();
                     closure_posix(
                         program,
-                        &mut st,
-                        &mut stack,
+                        best,
+                        best_gen,
+                        *gen,
+                        order,
+                        stack,
                         0,
                         Rc::new(vec![None; slot_limit.min(program.slot_count)]),
                         pos,
                         len,
                     );
-                    harvest(&mut st, &mut clist);
+                    harvest(best, order, clist);
                 }
                 None => break,
             }
@@ -507,12 +529,21 @@ pub fn exec_posix(
         // Closures during this drain run under a fresh generation; a
         // harvest never shares a generation with a later closure, so a
         // taken (`None`) entry can never be mistaken for a live claim.
-        st.gen += 1;
+        *gen += 1;
         for (pc, slots) in clist.drain(..) {
             match step(program, pc, c, fc) {
-                Step::Advance => {
-                    closure_posix(program, &mut st, &mut stack, pc + 1, slots, next_pos, len)
-                }
+                Step::Advance => closure_posix(
+                    program,
+                    best,
+                    best_gen,
+                    *gen,
+                    order,
+                    stack,
+                    pc + 1,
+                    slots,
+                    next_pos,
+                    len,
+                ),
                 Step::Die => {}
                 Step::Matched => {
                     // (map_or, not is_none_or: MSRV is 1.75.)
@@ -525,7 +556,7 @@ pub fn exec_posix(
                 }
             }
         }
-        harvest(&mut st, &mut clist);
+        harvest(best, order, clist);
         if c.is_none() || clist.is_empty() {
             break;
         }
@@ -542,12 +573,12 @@ pub fn exec_posix(
     })
 }
 
-/// Moves the step's surviving threads out of `st` into `clist`. Stale
-/// `best` entries are invalidated by the next generation bump — no
+/// Moves the step's surviving threads out of `best`/`order` into `clist`.
+/// Stale `best` entries are invalidated by the next generation bump — no
 /// O(program) reset here.
-fn harvest(st: &mut PosixStep, clist: &mut Vec<(usize, Slots)>) {
-    for pc in st.order.drain(..) {
-        let slots = st.best[pc].take().expect("ordered pc has best slots");
+fn harvest(best: &mut [Option<Slots>], order: &mut Vec<usize>, clist: &mut Vec<(usize, Slots)>) {
+    for pc in order.drain(..) {
+        let slots = best[pc].take().expect("ordered pc has best slots");
         clist.push((pc, slots));
     }
 }
@@ -557,9 +588,13 @@ fn harvest(st: &mut PosixStep, clist: &mut Vec<(usize, Slots)>) {
 /// compare better, re-propagating downstream. Each pc's value strictly
 /// improves on every replacement, so the closure terminates; total work per
 /// step is `O(program^2)` worst case.
+#[allow(clippy::too_many_arguments)] // internal; mirrors the VM's state
 fn closure_posix(
     program: &Program,
-    st: &mut PosixStep,
+    best: &mut [Option<Slots>],
+    best_gen: &mut [u64],
+    gen: u64,
+    order: &mut Vec<usize>,
     stack: &mut Vec<(usize, Slots)>,
     pc: usize,
     slots: Slots,
@@ -569,23 +604,23 @@ fn closure_posix(
     debug_assert!(stack.is_empty());
     stack.push((pc, slots));
     while let Some((pc, slots)) = stack.pop() {
-        if st.best_gen[pc] == st.gen {
+        if best_gen[pc] == gen {
             // Claimed this step: replace only if strictly better.
-            match &st.best[pc] {
+            match &best[pc] {
                 Some(cur) if !posix_better(program, &slots, cur) => continue,
                 _ => {}
             }
         } else {
             // First claim this step.
-            st.best_gen[pc] = st.gen;
+            best_gen[pc] = gen;
             if matches!(
                 program.insts[pc],
                 Inst::Char(_) | Inst::AnyChar | Inst::Class(_) | Inst::Match
             ) {
-                st.order.push(pc);
+                order.push(pc);
             }
         }
-        st.best[pc] = Some(slots.clone());
+        best[pc] = Some(slots.clone());
         match &program.insts[pc] {
             Inst::Jump(target) => stack.push((*target, slots)),
             Inst::Split { first, second } => {
