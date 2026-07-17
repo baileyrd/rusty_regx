@@ -27,6 +27,10 @@ pub enum Inst {
     Char(char),
     /// Match any single character.
     AnyChar,
+    /// Match any single character unconditionally — the unanchored-search
+    /// scan loop. Unlike a pattern `.`, this must cross newlines even in
+    /// `REG_NEWLINE` mode (it moves the search, it doesn't match text).
+    ScanAny,
     /// Match one character against `Program::classes[i]`.
     Class(usize),
     /// Assert start of input.
@@ -152,6 +156,11 @@ pub struct Program {
     /// branch) — upgrades the suffix check from `contains` to
     /// `ends_with`.
     pub suffix_anchored: bool,
+    /// POSIX `REG_NEWLINE` mode: `.` and negated bracket expressions
+    /// don't match `\n` (the class exclusion is compiled in; the `.`
+    /// exclusion is checked by the VM), and `^`/`$` also match right
+    /// after/before a `\n`.
+    pub newline: bool,
 }
 
 /// A pattern that is a plain literal, matched by substring search.
@@ -190,17 +199,20 @@ pub fn fold(c: char) -> char {
 /// `=~` semantics. Anchored programs omit the prefix entirely: their
 /// thread list empties as soon as position 0 fails, so `^b` against a
 /// megabyte of text stops after one character instead of scanning it all.
-pub fn compile(mut ast: Ast, icase: bool) -> Result<Program, Error> {
+pub fn compile(mut ast: Ast, icase: bool, newline: bool) -> Result<Program, Error> {
     let group_count = max_group(&ast) as usize + 1;
     let mut tag_order = vec![0];
     let mut next_slot = 2 * group_count;
     number(&mut ast, &mut next_slot, &mut tag_order);
 
-    let anchored = starts_anchored(&ast);
+    // Under REG_NEWLINE, `^` matches after any newline, so the
+    // anchored-at-0 fast path doesn't apply.
+    let anchored = starts_anchored(&ast) && !newline;
     let mut c = Compiler {
         insts: Vec::new(),
         classes: Vec::new(),
         icase,
+        newline,
     };
     if !anchored {
         // Unanchored-search prefix, non-greedy: prefer starting the match
@@ -209,7 +221,7 @@ pub fn compile(mut ast: Ast, icase: bool) -> Result<Program, Error> {
             first: 3,
             second: 1,
         })?;
-        c.push(Inst::AnyChar)?;
+        c.push(Inst::ScanAny)?;
         c.push(Inst::Jump(0))?;
     }
     c.push(Inst::Save(0))?;
@@ -229,13 +241,17 @@ pub fn compile(mut ast: Ast, icase: bool) -> Result<Program, Error> {
         collect_suffix_rev(&ast, &mut suffix);
         suffix = suffix.chars().rev().collect();
     }
-    let suffix_anchored = ends_anchored(&ast);
+    // Under REG_NEWLINE, `\$` also matches before a newline, so the
+    // suffix may sit anywhere — keep the contains() check only.
+    let suffix_anchored = ends_anchored(&ast) && !newline;
     // Groups need real capture tracking; the substring path reports only
     // group 0.
     let literal = if icase || group_count > 1 {
         None
     } else {
-        literal_of(&ast)
+        // Anchored literals assume `^`/`$` mean input start/end, which
+        // REG_NEWLINE changes; unanchored literals stay valid.
+        literal_of(&ast).filter(|l| !newline || (!l.anchored_start && !l.anchored_end))
     };
     Ok(Program {
         insts: c.insts,
@@ -248,6 +264,7 @@ pub fn compile(mut ast: Ast, icase: bool) -> Result<Program, Error> {
         literal,
         suffix,
         suffix_anchored,
+        newline,
     })
 }
 
@@ -470,6 +487,7 @@ struct Compiler {
     insts: Vec<Inst>,
     classes: Vec<CompiledClass>,
     icase: bool,
+    newline: bool,
 }
 
 /// Sorts ranges by start and merges overlapping or adjacent ones, so
@@ -516,6 +534,12 @@ impl Compiler {
             }
             Ast::Class(class) => {
                 let mut class = self.fold_class(class)?;
+                // REG_NEWLINE: a negated class also excludes newline;
+                // adding it to the positive set before negation compiles
+                // the exclusion in at zero runtime cost.
+                if self.newline && class.negated {
+                    class.ranges.push(('\n', '\n'));
+                }
                 normalize_ranges(&mut class.ranges);
                 let index = self.classes.len();
                 self.classes.push(CompiledClass::new(class));

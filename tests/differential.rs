@@ -75,10 +75,6 @@ const CLASSES_CI: &[&str] = &[
     "[A-]",
 ];
 
-/// Extra classes only the bash oracles get: the regex crate rejects
-/// collating syntax outright.
-const CLASSES_BASH_EXTRA: &[&str] = &["[[.a.]]", "[[.a.]-c]", "[[=b=]]"];
-
 const LETTERS: &[u8] = b"abc01 ";
 const LETTERS_CI: &[u8] = b"abcABC01 ";
 

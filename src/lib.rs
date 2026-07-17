@@ -125,9 +125,25 @@ impl Regex {
         Self::compile(pattern, false, true)
     }
 
+    /// Starts building a regex with non-default options — the general
+    /// form of the `new_*` constructors, plus options they don't cover
+    /// (currently [`RegexBuilder::newline`]).
+    pub fn builder() -> RegexBuilder {
+        RegexBuilder::default()
+    }
+
     fn compile(pattern: &str, posix: bool, icase: bool) -> Result<Regex, Error> {
+        Regex::compile_full(pattern, posix, icase, false)
+    }
+
+    fn compile_full(
+        pattern: &str,
+        posix: bool,
+        icase: bool,
+        newline: bool,
+    ) -> Result<Regex, Error> {
         let ast = parser::parse(pattern)?;
-        let program = compile::compile(ast, icase)?;
+        let program = compile::compile(ast, icase, newline)?;
         Ok(Regex {
             pattern: pattern.into(),
             program,
@@ -274,6 +290,59 @@ impl std::str::FromStr for Regex {
 
     fn from_str(pattern: &str) -> Result<Regex, Error> {
         Regex::new(pattern)
+    }
+}
+
+/// Configures and compiles a [`Regex`] — the general form of the
+/// `new_*` constructors (see [`Regex::builder`]).
+///
+/// ```
+/// let re = rusty_regx::Regex::builder()
+///     .posix(true)
+///     .newline(true)
+///     .build("^ab$")?;
+/// assert!(re.is_match("x\nab\ny")); // ^/$ match at line boundaries
+/// # Ok::<(), rusty_regx::Error>(())
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct RegexBuilder {
+    posix: bool,
+    case_insensitive: bool,
+    newline: bool,
+}
+
+impl RegexBuilder {
+    /// Equivalent to [`RegexBuilder::default`].
+    pub fn new() -> RegexBuilder {
+        RegexBuilder::default()
+    }
+
+    /// POSIX leftmost-longest match semantics, as [`Regex::new_posix`].
+    pub fn posix(mut self, yes: bool) -> RegexBuilder {
+        self.posix = yes;
+        self
+    }
+
+    /// `REG_ICASE` case-insensitive matching, as [`Regex::new_posix_ci`] /
+    /// [`Regex::new_ci`].
+    pub fn case_insensitive(mut self, yes: bool) -> RegexBuilder {
+        self.case_insensitive = yes;
+        self
+    }
+
+    /// POSIX `REG_NEWLINE` mode: `.` and negated bracket expressions do
+    /// not match `\n`, and `^`/`$` also match right after/before one —
+    /// grep-style line-oriented matching over multi-line text. bash's
+    /// `=~` does *not* use this mode; it exists for grep-shaped
+    /// consumers.
+    pub fn newline(mut self, yes: bool) -> RegexBuilder {
+        self.newline = yes;
+        self
+    }
+
+    /// Compiles `pattern` with the configured options.
+    pub fn build(&self, pattern: &str) -> Result<Regex, Error> {
+        Regex::compile_full(pattern, self.posix, self.case_insensitive, self.newline)
     }
 }
 
