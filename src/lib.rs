@@ -38,6 +38,7 @@
 //! See `DESIGN.md` in the repository for the full design and roadmap.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 mod ast;
 mod compile;

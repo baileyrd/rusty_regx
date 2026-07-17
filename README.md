@@ -1,5 +1,7 @@
 # rusty_regx
 
+[![CI](https://github.com/baileyrd/rusty_regx/actions/workflows/ci.yml/badge.svg)](https://github.com/baileyrd/rusty_regx/actions/workflows/ci.yml)
+
 A minimal, linear-time [POSIX Extended Regular
 Expression](https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap09.html)
 engine in Rust, with **zero dependencies** and **no backtracking**.
