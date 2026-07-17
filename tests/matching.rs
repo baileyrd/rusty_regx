@@ -227,6 +227,42 @@ fn new_ci_is_leftmost_first_and_case_insensitive() {
     );
 }
 
+/// The VM uses `Rc` internally (copy-on-write capture slots); this fails
+/// to compile if that ever leaks into the public types.
+#[test]
+fn regex_is_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Regex>();
+    assert_send_sync::<rusty_regx::Captures<'_>>();
+    assert_send_sync::<rusty_regx::Error>();
+}
+
+#[test]
+fn spans_iter_and_index() {
+    let re = Regex::new("(a)(x)?(b)").unwrap();
+    let caps = re.captures("zzab").unwrap();
+    assert_eq!(caps.span(0), Some((2, 4)));
+    assert_eq!(caps.span(1), Some((2, 3)));
+    assert_eq!(caps.span(2), None); // did not participate
+    assert_eq!(caps.span(3), Some((3, 4)));
+    assert_eq!(caps.span(4), None); // out of range
+                                    // Spans fall on char boundaries in multibyte text.
+    let caps = Regex::new("(é)").unwrap().captures("xéy").unwrap();
+    assert_eq!(caps.span(1), Some((1, 3)));
+    // iter() yields every group in order, absent ones as None.
+    let re = Regex::new("(a)(x)?(b)").unwrap();
+    let caps = re.captures("zzab").unwrap();
+    let all: Vec<Option<&str>> = caps.iter().collect();
+    assert_eq!(all, vec![Some("ab"), Some("a"), None, Some("b")]);
+    // Indexing panics only on absent groups.
+    assert_eq!(&caps[0], "ab");
+    assert_eq!(&caps[3], "b");
+    assert!(std::panic::catch_unwind(|| {
+        let _ = &caps[2];
+    })
+    .is_err());
+}
+
 #[test]
 fn regex_reports_its_pattern() {
     let re = Regex::new("a|b").unwrap();
@@ -246,6 +282,73 @@ fn groups_of(re: &Regex, text: &str) -> Option<Vec<Option<String>>> {
             .map(|i| caps.get(i).map(str::to_owned))
             .collect()
     })
+}
+
+/// The anchored fast path and literal-prefix fast-forward are pure
+/// optimizations — these pin the cases where a buggy version would
+/// change results (threads that loop back to the pattern head, captures
+/// recorded across skipped regions, mixed anchored/unanchored branches).
+#[test]
+fn scan_optimizations_preserve_semantics() {
+    // Anchored: no unanchored prefix is compiled.
+    assert_eq!(find("^a", "xxa"), None);
+    assert_eq!(find("^a|^b", "zab"), None);
+    assert_eq!(find("(^a)(b)", "ab"), Some("ab"));
+    assert_eq!(find("^(a|b)+c$", "bac"), Some("bac"));
+    // Mixed branches are NOT anchored: the unanchored one must still search.
+    assert_eq!(find("^a|b", "zzb"), Some("b"));
+    // (^a)?b matches b anywhere — a min-0 head never anchors.
+    assert_eq!(find("(^a)?b", "zzb"), Some("b"));
+
+    // Literal-prefix fast-forward: matches after long skippable gaps,
+    // with captures reporting the right (post-skip) offsets.
+    let text = format!("{}ab-12", ".".repeat(1000).replace('.', "x"));
+    assert_eq!(
+        groups("(a)(b)-([0-9]+)", &text),
+        Some(vec![
+            Some("ab-12".into()),
+            Some("a".into()),
+            Some("b".into()),
+            Some("12".into())
+        ])
+    );
+    // Loop-back-to-head shapes: a thread mid-iteration must never be
+    // mistaken for a fresh restart state.
+    assert_eq!(find("(ab)+c", "ab abababc"), Some("abababc"));
+    assert_eq!(find("a+b", "aaa aab"), Some("aab"));
+    assert_eq!(
+        groups("(a+)(b)", "aa aaab"),
+        Some(vec![
+            Some("aaab".into()),
+            Some("aaa".into()),
+            Some("b".into())
+        ])
+    );
+    // The required char never recurs: must report no match, quickly.
+    assert_eq!(find("ab", "zzzzzz"), None);
+    // POSIX mode takes the same paths.
+    assert_eq!(find_posix("(ab)+c", "ab abababc"), Some("abababc"));
+    assert_eq!(find_posix("^a|^b", "zab"), None);
+    assert_eq!(
+        groups_posix("(a+)(b)", "aa aaab"),
+        Some(vec![
+            Some("aaab".into()),
+            Some("aaa".into()),
+            Some("b".into())
+        ])
+    );
+    // And is_match agrees everywhere.
+    for (p, t) in [
+        ("^a", "xxa"),
+        ("(ab)+c", "ab abababc"),
+        ("a+b", "aaa aab"),
+        ("ab", "zzzzzz"),
+        ("^a|b", "zzb"),
+    ] {
+        for re in [Regex::new(p).unwrap(), Regex::new_posix(p).unwrap()] {
+            assert_eq!(re.is_match(t), re.captures(t).is_some(), "{p} on {t}");
+        }
+    }
 }
 
 #[test]

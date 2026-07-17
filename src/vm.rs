@@ -59,13 +59,50 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
         0,
         len,
     );
+    // The thread state a scan (re)starts from; used by the fast-forward
+    // check below. Captured at position 0, which never fires for patterns
+    // with an anchored head branch (their restart set shrinks after 0) —
+    // that is safe, just unaccelerated.
+    let restart: Vec<usize> = clist.iter().map(|t| t.0).collect();
 
-    let mut steps = text.char_indices();
+    let mut pos = 0;
     loop {
-        let (pos, c) = match steps.next() {
-            Some((i, ch)) => (i, Some(ch)),
-            None => (len, None),
-        };
+        // Fast-forward: when the pattern requires a literal first char and
+        // every live thread is indistinguishable from a fresh restart
+        // (same pcs, and every recorded offset equals the current position
+        // — i.e. no thread carries progress), nothing can match before the
+        // next occurrence of that char. Skip the scan straight to it.
+        if let Some(want) = program.prefix_char {
+            if matched.is_none()
+                && clist.len() == restart.len()
+                && clist.iter().map(|t| t.0).eq(restart.iter().copied())
+                && clist
+                    .iter()
+                    .all(|(_, s)| s.iter().flatten().all(|&v| v == pos))
+            {
+                match text[pos..].find(want) {
+                    Some(0) => {}
+                    Some(off) => {
+                        pos += off;
+                        visited.fill(false);
+                        clist.clear();
+                        add_thread(
+                            program,
+                            &mut clist,
+                            &mut visited,
+                            &mut stack,
+                            0,
+                            Rc::new(vec![None; program.slot_count]),
+                            pos,
+                            len,
+                        );
+                    }
+                    // The required char never occurs again: no match.
+                    None => break,
+                }
+            }
+        }
+        let c = text[pos..].chars().next();
         let next_pos = pos + c.map_or(0, char::len_utf8);
         // The pattern side was folded at compile time; fold the input to
         // match. Positions (and so captures) always use the original text.
@@ -102,8 +139,8 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
                         );
                     }
                 }
-                Inst::Class(class) => {
-                    if fc.is_some_and(|ch| class_matches(class, ch)) {
+                Inst::Class(i) => {
+                    if fc.is_some_and(|ch| class_matches(&program.classes[*i], ch)) {
                         add_thread(
                             program,
                             &mut nlist,
@@ -135,6 +172,7 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
         if c.is_none() || clist.is_empty() {
             break;
         }
+        pos = next_pos;
     }
 
     matched.map(|slots| {
@@ -216,13 +254,22 @@ pub fn exec_bool(program: &Program, text: &str) -> bool {
     let mut visited = vec![false; program.insts.len()];
     let mut stack: Vec<usize> = Vec::new();
     add_thread_bool(program, &mut clist, &mut visited, &mut stack, 0, 0, len);
+    // Boolean threads are bare pcs, so pc-list equality with the restart
+    // state is exact state equality — see the fast-forward note in `exec`.
+    let restart: Vec<usize> = clist.clone();
 
-    let mut steps = text.char_indices();
+    let mut pos = 0;
     loop {
-        let (pos, c) = match steps.next() {
-            Some((i, ch)) => (i, Some(ch)),
-            None => (len, None),
-        };
+        if let Some(want) = program.prefix_char {
+            if clist == restart {
+                match text[pos..].find(want) {
+                    Some(0) => {}
+                    Some(off) => pos += off,
+                    None => return false,
+                }
+            }
+        }
+        let c = text[pos..].chars().next();
         let next_pos = pos + c.map_or(0, char::len_utf8);
         let fc = if program.icase { c.map(fold) } else { c };
         visited.fill(false);
@@ -255,8 +302,8 @@ pub fn exec_bool(program: &Program, text: &str) -> bool {
                         );
                     }
                 }
-                Inst::Class(class) => {
-                    if fc.is_some_and(|ch| class_matches(class, ch)) {
+                Inst::Class(i) => {
+                    if fc.is_some_and(|ch| class_matches(&program.classes[*i], ch)) {
                         add_thread_bool(
                             program,
                             &mut nlist,
@@ -280,6 +327,7 @@ pub fn exec_bool(program: &Program, text: &str) -> bool {
         if c.is_none() || clist.is_empty() {
             return false;
         }
+        pos = next_pos;
     }
 }
 
@@ -345,13 +393,41 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
         program, &mut best, &mut order, &mut stack, 0, initial, 0, len,
     );
     harvest(&mut best, &mut order, &mut clist);
+    // See the fast-forward note in `exec`.
+    let restart: Vec<usize> = clist.iter().map(|t| t.0).collect();
 
-    let mut steps = text.char_indices();
+    let mut pos = 0;
     loop {
-        let (pos, c) = match steps.next() {
-            Some((i, ch)) => (i, Some(ch)),
-            None => (len, None),
-        };
+        if let Some(want) = program.prefix_char {
+            if best_match.is_none()
+                && clist.len() == restart.len()
+                && clist.iter().map(|t| t.0).eq(restart.iter().copied())
+                && clist
+                    .iter()
+                    .all(|(_, s)| s.iter().flatten().all(|&v| v == pos))
+            {
+                match text[pos..].find(want) {
+                    Some(0) => {}
+                    Some(off) => {
+                        pos += off;
+                        clist.clear();
+                        closure_posix(
+                            program,
+                            &mut best,
+                            &mut order,
+                            &mut stack,
+                            0,
+                            Rc::new(vec![None; program.slot_count]),
+                            pos,
+                            len,
+                        );
+                        harvest(&mut best, &mut order, &mut clist);
+                    }
+                    None => break,
+                }
+            }
+        }
+        let c = text[pos..].chars().next();
         let next_pos = pos + c.map_or(0, char::len_utf8);
         let fc = if program.icase { c.map(fold) } else { c };
         for (pc, slots) in clist.drain(..) {
@@ -384,8 +460,8 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
                         );
                     }
                 }
-                Inst::Class(class) => {
-                    if fc.is_some_and(|ch| class_matches(class, ch)) {
+                Inst::Class(i) => {
+                    if fc.is_some_and(|ch| class_matches(&program.classes[*i], ch)) {
                         closure_posix(
                             program,
                             &mut best,
@@ -418,6 +494,7 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
         if c.is_none() || clist.is_empty() {
             break;
         }
+        pos = next_pos;
     }
 
     best_match.map(|slots| {
@@ -530,9 +607,12 @@ fn posix_better(program: &Program, a: &Slots, b: &Slots) -> bool {
     false
 }
 
+/// Ranges are compile-time sorted and merged (see `normalize_ranges`), so
+/// membership is a binary search.
 fn class_matches(class: &Class, c: char) -> bool {
-    let hit = class.ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi)
-        || class.posix.iter().any(|&p| posix_matches(p, c));
+    let i = class.ranges.partition_point(|&(lo, _)| lo <= c);
+    let hit =
+        (i > 0 && class.ranges[i - 1].1 >= c) || class.posix.iter().any(|&p| posix_matches(p, c));
     hit != class.negated
 }
 

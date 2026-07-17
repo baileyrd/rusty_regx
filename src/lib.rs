@@ -187,29 +187,61 @@ impl<'t> Captures<'t> {
     /// The text matched by group `i`, or `None` if the group did not
     /// participate in the match (or `i` is out of range).
     pub fn get(&self, i: usize) -> Option<&'t str> {
-        self.slots
-            .get(i)
-            .copied()
-            .flatten()
-            .map(|(start, end)| &self.text[start..end])
+        self.span(i).map(|(start, end)| &self.text[start..end])
+    }
+
+    /// The byte span `(start, end)` of group `i` in the searched text, or
+    /// `None` if the group did not participate in the match (or `i` is out
+    /// of range). Both offsets fall on `char` boundaries.
+    pub fn span(&self, i: usize) -> Option<(usize, usize)> {
+        self.slots.get(i).copied().flatten()
+    }
+
+    /// Iterates over all groups (group 0 first): `Some(text)` for groups
+    /// that participated in the match, `None` for those that did not.
+    pub fn iter(&self) -> impl Iterator<Item = Option<&'t str>> + '_ {
+        (0..self.len()).map(|i| self.get(i))
+    }
+}
+
+/// `caps[i]` is the text of group `i`.
+///
+/// # Panics
+///
+/// If group `i` did not participate in the match or is out of range; use
+/// [`Captures::get`] for a fallible lookup.
+impl std::ops::Index<usize> for Captures<'_> {
+    type Output = str;
+
+    fn index(&self, i: usize) -> &str {
+        self.get(i)
+            .unwrap_or_else(|| panic!("no capture group {i}"))
     }
 }
 
 /// Escapes `text` so it matches itself literally under this engine.
 ///
 /// Exactly this engine's metacharacters are escaped: `^ $ . [ ] ( ) | * + ? { } \`.
-pub fn escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if matches!(
+/// Borrows the input unchanged when it contains none of them — the common
+/// case for shell words — so no allocation happens.
+pub fn escape(text: &str) -> std::borrow::Cow<'_, str> {
+    let is_meta = |c: char| {
+        matches!(
             c,
             '^' | '$' | '.' | '[' | ']' | '(' | ')' | '|' | '*' | '+' | '?' | '{' | '}' | '\\'
-        ) {
+        )
+    };
+    if !text.chars().any(is_meta) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    for c in text.chars() {
+        if is_meta(c) {
             out.push('\\');
         }
         out.push(c);
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -227,5 +259,14 @@ mod tests {
     fn escape_escapes_every_metacharacter() {
         assert_eq!(escape(r"^$.[]()|*+?{}\"), r"\^\$\.\[\]\(\)\|\*\+\?\{\}\\");
         assert_eq!(escape("a.b*c"), r"a\.b\*c");
+    }
+
+    #[test]
+    fn escape_borrows_when_nothing_to_escape() {
+        assert!(matches!(
+            escape("hello"),
+            std::borrow::Cow::Borrowed("hello")
+        ));
+        assert!(matches!(escape("a.b"), std::borrow::Cow::Owned(_)));
     }
 }

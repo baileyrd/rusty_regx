@@ -17,14 +17,18 @@ pub const MAX_REPETITION_SIZE: u32 = 1000;
 pub const MAX_PROGRAM_SIZE: usize = 1 << 16;
 
 /// A single VM instruction.
-#[derive(Debug, Clone)]
+///
+/// Classes live in [`Program::classes`] and are referenced by index, so
+/// instructions stay small and `Copy` and the dispatch loop stays
+/// cache-friendly.
+#[derive(Debug, Clone, Copy)]
 pub enum Inst {
     /// Match one literal character.
     Char(char),
     /// Match any single character.
     AnyChar,
-    /// Match one character against a class.
-    Class(Class),
+    /// Match one character against `Program::classes[i]`.
+    Class(usize),
     /// Assert start of input.
     StartAnchor,
     /// Assert end of input.
@@ -43,6 +47,10 @@ pub enum Inst {
 #[derive(Debug, Clone)]
 pub struct Program {
     pub insts: Vec<Inst>,
+    /// Interned bracket expressions, referenced by `Inst::Class` index.
+    /// Ranges are normalized at compile time: sorted by start and merged,
+    /// so the VM can binary-search them.
+    pub classes: Vec<Class>,
     /// Number of capture groups including group 0.
     pub group_count: usize,
     /// Total `Save` slots: two per group, plus two per repetition (hidden
@@ -56,6 +64,14 @@ pub struct Program {
     /// pattern literals and range endpoints via [`fold`]; the VM must fold
     /// each input character the same way before comparing.
     pub icase: bool,
+    /// The literal character every match must start with, if there is one
+    /// (and the program has an unanchored prefix to accelerate). The VM
+    /// may fast-forward the scan to its next occurrence whenever no live
+    /// thread carries progress. `None` for anchored programs, `icase`
+    /// mode (the input folds before comparing, so a plain substring
+    /// search would miss case variants), and patterns without a single
+    /// mandatory first literal.
+    pub prefix_char: Option<char>,
 }
 
 /// The `REG_ICASE` case fold: simple (single-character) uppercase mapping.
@@ -77,8 +93,12 @@ pub fn fold(c: char) -> char {
 
 /// Compiles an AST into a [`Program`].
 ///
-/// The program begins with an implicit non-greedy "any char" loop so that
-/// execution is an unanchored search, matching bash `=~` semantics.
+/// Unless every match is forced to start at position 0 (the pattern is
+/// start-anchored), the program begins with an implicit non-greedy "any
+/// char" loop so that execution is an unanchored search, matching bash
+/// `=~` semantics. Anchored programs omit the prefix entirely: their
+/// thread list empties as soon as position 0 fails, so `^b` against a
+/// megabyte of text stops after one character instead of scanning it all.
 pub fn compile(ast: &Ast, icase: bool) -> Result<Program, Error> {
     let group_count = max_group(ast) as usize + 1;
     let mut ast = ast.clone();
@@ -86,29 +106,75 @@ pub fn compile(ast: &Ast, icase: bool) -> Result<Program, Error> {
     let mut next_slot = 2 * group_count;
     number(&mut ast, &mut next_slot, &mut tag_order);
 
+    let anchored = starts_anchored(&ast);
     let mut c = Compiler {
         insts: Vec::new(),
+        classes: Vec::new(),
         icase,
     };
-    // Unanchored-search prefix, non-greedy: prefer starting the match at the
-    // current position (leftmost) over consuming another character.
-    c.push(Inst::Split {
-        first: 3,
-        second: 1,
-    })?;
-    c.push(Inst::AnyChar)?;
-    c.push(Inst::Jump(0))?;
+    if !anchored {
+        // Unanchored-search prefix, non-greedy: prefer starting the match
+        // at the current position (leftmost) over consuming another char.
+        c.push(Inst::Split {
+            first: 3,
+            second: 1,
+        })?;
+        c.push(Inst::AnyChar)?;
+        c.push(Inst::Jump(0))?;
+    }
     c.push(Inst::Save(0))?;
     c.emit(&ast)?;
     c.push(Inst::Save(1))?;
     c.push(Inst::Match)?;
+    let prefix_char = if anchored || icase {
+        None
+    } else {
+        first_char(&ast)
+    };
     Ok(Program {
         insts: c.insts,
+        classes: c.classes,
         group_count,
         slot_count: next_slot,
         tag_order,
         icase,
+        prefix_char,
     })
+}
+
+/// Whether every match of `ast` must start at position 0 — i.e. every
+/// alternation branch begins with `^`. A `min == 0` repetition head is
+/// never anchored: `(^a)?b` matches `b` anywhere.
+fn starts_anchored(ast: &Ast) -> bool {
+    match ast {
+        Ast::StartAnchor => true,
+        Ast::Concat(items) => items.first().is_some_and(starts_anchored),
+        Ast::Alternation(branches) => branches.iter().all(starts_anchored),
+        Ast::Group(_, inner) => starts_anchored(inner),
+        Ast::Repeat { ast, min, .. } => *min >= 1 && starts_anchored(ast),
+        _ => false,
+    }
+}
+
+/// The single literal character every match must start with, if any.
+/// Conservative: `None` unless every path through the pattern's head
+/// consumes exactly this character first (so a `min == 0` repetition or
+/// class head disqualifies).
+fn first_char(ast: &Ast) -> Option<char> {
+    match ast {
+        Ast::Char(c) => Some(*c),
+        Ast::Concat(items) => first_char(items.first()?),
+        Ast::Alternation(branches) => {
+            let c = first_char(branches.first()?)?;
+            branches
+                .iter()
+                .all(|b| first_char(b) == Some(c))
+                .then_some(c)
+        }
+        Ast::Group(_, inner) => first_char(inner),
+        Ast::Repeat { ast, min, .. } if *min >= 1 => first_char(ast),
+        _ => None,
+    }
 }
 
 /// Assigns span-tag slots to repetitions and records the disambiguation
@@ -161,7 +227,26 @@ fn max_group(ast: &Ast) -> u32 {
 
 struct Compiler {
     insts: Vec<Inst>,
+    classes: Vec<Class>,
     icase: bool,
+}
+
+/// Sorts ranges by start and merges overlapping or adjacent ones, so
+/// membership tests can binary-search ([`Class`] invariant after
+/// compilation).
+fn normalize_ranges(ranges: &mut Vec<(char, char)>) {
+    ranges.sort_unstable();
+    let mut merged: Vec<(char, char)> = Vec::with_capacity(ranges.len());
+    for &(lo, hi) in ranges.iter() {
+        match merged.last_mut() {
+            // Adjacent counts too: [a-cd-f] is one range.
+            Some(&mut (_, ref mut phi)) if lo as u32 <= *phi as u32 + 1 => {
+                *phi = (*phi).max(hi);
+            }
+            _ => merged.push((lo, hi)),
+        }
+    }
+    *ranges = merged;
 }
 
 impl Compiler {
@@ -189,8 +274,11 @@ impl Compiler {
                 self.push(Inst::AnyChar)?;
             }
             Ast::Class(class) => {
-                let class = self.fold_class(class)?;
-                self.push(Inst::Class(class))?;
+                let mut class = self.fold_class(class)?;
+                normalize_ranges(&mut class.ranges);
+                let index = self.classes.len();
+                self.classes.push(class);
+                self.push(Inst::Class(index))?;
             }
             Ast::StartAnchor => {
                 self.push(Inst::StartAnchor)?;

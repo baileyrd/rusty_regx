@@ -71,6 +71,25 @@ fn main() {
         time(20, || theirs.is_match(&text)),
     );
 
+    // Anchored no-match on a large haystack: the anchored fast path skips
+    // the scan entirely (rush's `=~` patterns are usually `^...$`-shaped).
+    let ours_anchored = rusty_regx::Regex::new("^nope").unwrap();
+    let theirs_anchored = regex::Regex::new("^nope").unwrap();
+    row(
+        "captures, ^-anchored 96KB no-match",
+        time(2_000, || ours_anchored.captures(&text).is_some()),
+        time(2_000, || theirs_anchored.captures(&text).is_some()),
+    );
+
+    // Literal-prefix fast-forward: rare first char in a big haystack.
+    let ours_lit = rusty_regx::Regex::new("qz[0-9]+").unwrap();
+    let theirs_lit = regex::Regex::new("qz[0-9]+").unwrap();
+    row(
+        "captures, literal-prefix 96KB no-match",
+        time(2_000, || ours_lit.captures(&text).is_some()),
+        time(2_000, || theirs_lit.captures(&text).is_some()),
+    );
+
     // Adversarial: catastrophic for backtrackers, must stay flat here.
     let a512 = "a".repeat(512);
     let ours = rusty_regx::Regex::new("(a+)+b").unwrap();
