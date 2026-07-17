@@ -24,9 +24,15 @@
 
 use crate::ast::{Class, PosixClass};
 use crate::compile::{fold, Inst, Program};
+use std::rc::Rc;
 
 /// Byte offsets recorded by `Save`; two slots per group.
-type Slots = Vec<Option<usize>>;
+///
+/// Reference-counted copy-on-write: a `Split` shares the vector between
+/// both threads in O(1), and only a `Save` on a shared vector pays for a
+/// clone (`Rc::make_mut`). `Rc` never escapes the VM, so `Regex` stays
+/// `Send + Sync`.
+type Slots = Rc<Vec<Option<usize>>>;
 
 /// Executes `program` against `text` as an unanchored, leftmost-first
 /// search.
@@ -38,10 +44,21 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
     let mut clist: Vec<(usize, Slots)> = Vec::new();
     let mut nlist: Vec<(usize, Slots)> = Vec::new();
     let mut visited = vec![false; program.insts.len()];
+    // Reused across every add_thread call; always drained back to empty.
+    let mut stack: Vec<(usize, Slots)> = Vec::new();
     let mut matched: Option<Slots> = None;
 
-    let initial = vec![None; program.slot_count];
-    add_thread(program, &mut clist, &mut visited, 0, initial, 0, len);
+    let initial = Rc::new(vec![None; program.slot_count]);
+    add_thread(
+        program,
+        &mut clist,
+        &mut visited,
+        &mut stack,
+        0,
+        initial,
+        0,
+        len,
+    );
 
     let mut steps = text.char_indices();
     loop {
@@ -63,6 +80,7 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
                             program,
                             &mut nlist,
                             &mut visited,
+                            &mut stack,
                             pc + 1,
                             slots,
                             next_pos,
@@ -76,6 +94,7 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
                             program,
                             &mut nlist,
                             &mut visited,
+                            &mut stack,
                             pc + 1,
                             slots,
                             next_pos,
@@ -89,6 +108,7 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
                             program,
                             &mut nlist,
                             &mut visited,
+                            &mut stack,
                             pc + 1,
                             slots,
                             next_pos,
@@ -135,16 +155,19 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
 /// priority and bounds work per step to one visit per instruction — the
 /// linear-time guarantee. Iterative so pathological epsilon chains cannot
 /// overflow the stack.
+#[allow(clippy::too_many_arguments)] // internal; mirrors the VM's state
 fn add_thread(
     program: &Program,
     list: &mut Vec<(usize, Slots)>,
     visited: &mut [bool],
+    stack: &mut Vec<(usize, Slots)>,
     pc: usize,
     slots: Slots,
     pos: usize,
     len: usize,
 ) {
-    let mut stack = vec![(pc, slots)];
+    debug_assert!(stack.is_empty());
+    stack.push((pc, slots));
     while let Some((pc, slots)) = stack.pop() {
         if visited[pc] {
             continue;
@@ -154,12 +177,13 @@ fn add_thread(
             Inst::Jump(target) => stack.push((*target, slots)),
             Inst::Split { first, second } => {
                 // `first` is explored (and claims pcs) before `second`.
+                // Sharing, not cloning: Save copies on write if needed.
                 stack.push((*second, slots.clone()));
                 stack.push((*first, slots));
             }
             Inst::Save(slot) => {
                 let mut slots = slots;
-                slots[*slot] = Some(pos);
+                Rc::make_mut(&mut slots)[*slot] = Some(pos);
                 stack.push((pc + 1, slots));
             }
             Inst::StartAnchor => {
@@ -190,7 +214,8 @@ pub fn exec_bool(program: &Program, text: &str) -> bool {
     let mut clist: Vec<usize> = Vec::new();
     let mut nlist: Vec<usize> = Vec::new();
     let mut visited = vec![false; program.insts.len()];
-    add_thread_bool(program, &mut clist, &mut visited, 0, 0, len);
+    let mut stack: Vec<usize> = Vec::new();
+    add_thread_bool(program, &mut clist, &mut visited, &mut stack, 0, 0, len);
 
     let mut steps = text.char_indices();
     loop {
@@ -206,17 +231,41 @@ pub fn exec_bool(program: &Program, text: &str) -> bool {
             match &program.insts[pc] {
                 Inst::Char(x) => {
                     if fc == Some(*x) {
-                        add_thread_bool(program, &mut nlist, &mut visited, pc + 1, next_pos, len);
+                        add_thread_bool(
+                            program,
+                            &mut nlist,
+                            &mut visited,
+                            &mut stack,
+                            pc + 1,
+                            next_pos,
+                            len,
+                        );
                     }
                 }
                 Inst::AnyChar => {
                     if c.is_some() {
-                        add_thread_bool(program, &mut nlist, &mut visited, pc + 1, next_pos, len);
+                        add_thread_bool(
+                            program,
+                            &mut nlist,
+                            &mut visited,
+                            &mut stack,
+                            pc + 1,
+                            next_pos,
+                            len,
+                        );
                     }
                 }
                 Inst::Class(class) => {
                     if fc.is_some_and(|ch| class_matches(class, ch)) {
-                        add_thread_bool(program, &mut nlist, &mut visited, pc + 1, next_pos, len);
+                        add_thread_bool(
+                            program,
+                            &mut nlist,
+                            &mut visited,
+                            &mut stack,
+                            pc + 1,
+                            next_pos,
+                            len,
+                        );
                     }
                 }
                 Inst::Match => return true,
@@ -239,11 +288,13 @@ fn add_thread_bool(
     program: &Program,
     list: &mut Vec<usize>,
     visited: &mut [bool],
+    stack: &mut Vec<usize>,
     pc: usize,
     pos: usize,
     len: usize,
 ) {
-    let mut stack = vec![pc];
+    debug_assert!(stack.is_empty());
+    stack.push(pc);
     while let Some(pc) = stack.pop() {
         if visited[pc] {
             continue;
@@ -286,10 +337,13 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
     let mut best: Vec<Option<Slots>> = vec![None; program.insts.len()];
     let mut order: Vec<usize> = Vec::new();
     let mut clist: Vec<(usize, Slots)> = Vec::new();
+    let mut stack: Vec<(usize, Slots)> = Vec::new();
     let mut best_match: Option<Slots> = None;
 
-    let initial = vec![None; program.slot_count];
-    closure_posix(program, &mut best, &mut order, 0, initial, 0, len);
+    let initial = Rc::new(vec![None; program.slot_count]);
+    closure_posix(
+        program, &mut best, &mut order, &mut stack, 0, initial, 0, len,
+    );
     harvest(&mut best, &mut order, &mut clist);
 
     let mut steps = text.char_indices();
@@ -304,17 +358,44 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
             match &program.insts[pc] {
                 Inst::Char(x) => {
                     if fc == Some(*x) {
-                        closure_posix(program, &mut best, &mut order, pc + 1, slots, next_pos, len);
+                        closure_posix(
+                            program,
+                            &mut best,
+                            &mut order,
+                            &mut stack,
+                            pc + 1,
+                            slots,
+                            next_pos,
+                            len,
+                        );
                     }
                 }
                 Inst::AnyChar => {
                     if c.is_some() {
-                        closure_posix(program, &mut best, &mut order, pc + 1, slots, next_pos, len);
+                        closure_posix(
+                            program,
+                            &mut best,
+                            &mut order,
+                            &mut stack,
+                            pc + 1,
+                            slots,
+                            next_pos,
+                            len,
+                        );
                     }
                 }
                 Inst::Class(class) => {
                     if fc.is_some_and(|ch| class_matches(class, ch)) {
-                        closure_posix(program, &mut best, &mut order, pc + 1, slots, next_pos, len);
+                        closure_posix(
+                            program,
+                            &mut best,
+                            &mut order,
+                            &mut stack,
+                            pc + 1,
+                            slots,
+                            next_pos,
+                            len,
+                        );
                     }
                 }
                 Inst::Match => {
@@ -366,16 +447,19 @@ fn harvest(best: &mut [Option<Slots>], order: &mut Vec<usize>, clist: &mut Vec<(
 /// compare better, re-propagating downstream. Each pc's value strictly
 /// improves on every replacement, so the closure terminates; total work per
 /// step is `O(program^2)` worst case.
+#[allow(clippy::too_many_arguments)] // internal; mirrors the VM's state
 fn closure_posix(
     program: &Program,
     best: &mut [Option<Slots>],
     order: &mut Vec<usize>,
+    stack: &mut Vec<(usize, Slots)>,
     pc: usize,
     slots: Slots,
     pos: usize,
     len: usize,
 ) {
-    let mut stack = vec![(pc, slots)];
+    debug_assert!(stack.is_empty());
+    stack.push((pc, slots));
     while let Some((pc, slots)) = stack.pop() {
         match &best[pc] {
             Some(cur) if !posix_better(program, &slots, cur) => continue,
@@ -398,7 +482,7 @@ fn closure_posix(
             }
             Inst::Save(slot) => {
                 let mut slots = slots;
-                slots[*slot] = Some(pos);
+                Rc::make_mut(&mut slots)[*slot] = Some(pos);
                 stack.push((pc + 1, slots));
             }
             Inst::StartAnchor => {
