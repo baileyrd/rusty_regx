@@ -21,6 +21,8 @@ pub enum Error {
     DanglingQuantifier,
     /// The pattern ends in a lone `\`.
     TrailingBackslash,
+    /// Groups are nested deeper than the parser's depth cap.
+    NestingTooDeep,
     /// An interval expansion exceeds the program-size cap.
     RepetitionTooLarge,
 }
@@ -35,6 +37,7 @@ impl fmt::Display for Error {
             Error::InvalidInterval => "invalid repetition interval",
             Error::DanglingQuantifier => "quantifier is not preceded by a repeatable expression",
             Error::TrailingBackslash => "pattern ends with a trailing backslash",
+            Error::NestingTooDeep => "groups are nested too deeply",
             Error::RepetitionTooLarge => "repetition interval is too large",
         };
         f.write_str(msg)

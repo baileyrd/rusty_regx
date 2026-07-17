@@ -18,9 +18,18 @@
 //!   literal.
 //! - Collating symbols `[.x.]` and equivalence classes `[=x=]` are
 //!   unsupported and rejected.
+//! - Groups may nest at most [`MAX_NESTING_DEPTH`] deep; beyond that the
+//!   pattern is rejected rather than risking a stack overflow.
 
 use crate::ast::{Ast, Class, PosixClass};
 use crate::error::Error;
+
+/// Cap on group-nesting depth. The parser recurses per nesting level (as do
+/// the compiler's AST walks and the AST's own `Drop`), so without a cap a
+/// user-supplied pattern like `((((…` overflows the stack and aborts the
+/// process — the shell must survive any pattern. 250 matches the `regex`
+/// crate's default `nest_limit`.
+const MAX_NESTING_DEPTH: u32 = 250;
 
 /// Parses an ERE pattern into an [`Ast`].
 pub fn parse(pattern: &str) -> Result<Ast, Error> {
@@ -28,6 +37,7 @@ pub fn parse(pattern: &str) -> Result<Ast, Error> {
         chars: pattern.chars().collect(),
         pos: 0,
         group_count: 0,
+        depth: 0,
     };
     let ast = parser.alternation()?;
     if parser.pos < parser.chars.len() {
@@ -41,6 +51,7 @@ struct Parser {
     chars: Vec<char>,
     pos: usize,
     group_count: u32,
+    depth: u32,
 }
 
 impl Parser {
@@ -127,12 +138,17 @@ impl Parser {
     fn atom(&mut self) -> Result<Ast, Error> {
         match self.bump().expect("atom() called with input remaining") {
             '(' => {
+                self.depth += 1;
+                if self.depth > MAX_NESTING_DEPTH {
+                    return Err(Error::NestingTooDeep);
+                }
                 self.group_count += 1;
                 let index = self.group_count;
                 let inner = self.alternation()?;
                 if !self.eat(')') {
                     return Err(Error::UnbalancedParenthesis);
                 }
+                self.depth -= 1;
                 Ok(Ast::Group(index, Box::new(inner)))
             }
             '[' => self.bracket(),
@@ -515,6 +531,23 @@ mod tests {
             parse("[[a]"),
             Ok(class(false, &[('[', '['), ('a', 'a')], &[]))
         );
+    }
+
+    #[test]
+    fn nesting_depth_is_capped() {
+        // At the cap: fine.
+        let deep = "(".repeat(250) + "a" + &")".repeat(250);
+        assert!(parse(&deep).is_ok());
+        // One past the cap: rejected.
+        let too_deep = "(".repeat(251) + "a" + &")".repeat(251);
+        assert_eq!(parse(&too_deep), Err(Error::NestingTooDeep));
+        // Nesting is what's capped, not the total number of groups.
+        let wide = "(a)".repeat(10_000);
+        assert!(parse(&wide).is_ok());
+        // The original crash case: a pathological pattern must be an error,
+        // never a stack overflow (this used to abort the process).
+        let pathological = "(".repeat(500_000);
+        assert_eq!(parse(&pathological), Err(Error::NestingTooDeep));
     }
 
     #[test]
