@@ -1,0 +1,83 @@
+//! Benchmarks against the `regex` crate (`cargo bench`).
+//!
+//! The crate exists to replace `regex` in rush's `[[ =~ ]]` conditional,
+//! so the workloads are rush-shaped: compile a user-supplied pattern, run
+//! it once or a handful of times, mostly on short shell-sized strings —
+//! plus full-scan and adversarial cases to track the engine's worst side.
+//! Plain `std::time` instead of a bench framework, keeping dev-dependencies
+//! to the `regex` crate alone.
+
+use std::time::{Duration, Instant};
+
+fn time<R>(iters: u32, mut f: impl FnMut() -> R) -> Duration {
+    // One warm-up, then the average of `iters` runs.
+    std::hint::black_box(f());
+    let start = Instant::now();
+    for _ in 0..iters {
+        std::hint::black_box(f());
+    }
+    start.elapsed() / iters
+}
+
+fn row(name: &str, ours: Duration, theirs: Duration) {
+    println!("{name:<38} {ours:>12.1?} {theirs:>12.1?}");
+}
+
+fn main() {
+    println!("{:<38} {:>12} {:>12}", "benchmark", "rusty_regx", "regex");
+
+    // Compilation: shells compile every pattern fresh.
+    let pat = "^([[:alpha:]]+)-([0-9]{2,4})$";
+    row(
+        "compile rush-shaped pattern",
+        time(2_000, || rusty_regx::Regex::new(pat).unwrap()),
+        time(2_000, || regex::Regex::new(pat).unwrap()),
+    );
+
+    // Short-string captures: the common `[[ =~ ]]` case.
+    let ours = rusty_regx::Regex::new(pat).unwrap();
+    let theirs = regex::Regex::new(pat).unwrap();
+    row(
+        "captures, short match",
+        time(20_000, || ours.captures("release-2026").is_some()),
+        time(20_000, || theirs.captures("release-2026").is_some()),
+    );
+    row(
+        "captures, short no-match",
+        time(20_000, || ours.captures("nope_2026").is_some()),
+        time(20_000, || theirs.captures("nope_2026").is_some()),
+    );
+
+    // Full-scan no-match over a long haystack: the engine's worst side
+    // (the regex crate's prefilters shine here; ours is a plain Pike VM).
+    let text: String = "abc def ghi jkl mno pqr stu vwx ".repeat(3_000);
+    let pat = "([[:alpha:]]+)-([0-9]{2,4})(x(y)(z))?";
+    let ours = rusty_regx::Regex::new(pat).unwrap();
+    let ours_posix = rusty_regx::Regex::new_posix(pat).unwrap();
+    let theirs = regex::Regex::new(pat).unwrap();
+    row(
+        "captures, 96KB scan no-match",
+        time(20, || ours.captures(&text).is_some()),
+        time(20, || theirs.captures(&text).is_some()),
+    );
+    row(
+        "captures, 96KB scan (POSIX mode)",
+        time(20, || ours_posix.captures(&text).is_some()),
+        Duration::ZERO, // no regex-crate equivalent
+    );
+    row(
+        "is_match, 96KB scan no-match",
+        time(20, || ours.is_match(&text)),
+        time(20, || theirs.is_match(&text)),
+    );
+
+    // Adversarial: catastrophic for backtrackers, must stay flat here.
+    let a512 = "a".repeat(512);
+    let ours = rusty_regx::Regex::new("(a+)+b").unwrap();
+    let theirs = regex::Regex::new("(a+)+b").unwrap();
+    row(
+        "captures, (a+)+b on a^512",
+        time(200, || ours.captures(&a512).is_some()),
+        time(200, || theirs.captures(&a512).is_some()),
+    );
+}

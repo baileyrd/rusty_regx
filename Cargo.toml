@@ -14,5 +14,9 @@ categories = ["text-processing"]
 
 [dev-dependencies]
 # Dev-only: the reference implementation for the differential harness
-# (tests/differential.rs). Never a runtime dependency.
+# (tests/differential.rs) and the benchmarks. Never a runtime dependency.
 regex = "1"
+
+[[bench]]
+name = "compare"
+harness = false
