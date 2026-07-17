@@ -4,32 +4,30 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
-## [0.1.0] — 2026-07-17
+## [0.2.0] — 2026-07-17
 
-First tagged release: the complete engine, integrated as the `[[ =~ ]]`
-backend of [`rush`](https://github.com/baileyrd/rush).
+Hardening, API, and performance pass on the 0.1.0 engine; now the
+`[[ =~ ]]` backend of [`rush`](https://github.com/baileyrd/rush).
 
-### Engine
+### Breaking
 
-- POSIX-ERE parser (full grammar including bracket corner cases),
-  bytecode compiler, and Pike VM with captures — linear-time, zero
-  dependencies, no `unsafe`.
-- POSIX leftmost-longest mode (`Regex::new_posix`) and case-insensitive
-  `REG_ICASE` modes (`Regex::new_posix_ci`, `Regex::new_ci`), verified
-  differentially against the `regex` crate and live bash 5.2 oracles.
-- Group-nesting depth cap (250): deeply nested user patterns report
-  `ErrorKind::NestingTooDeep` instead of overflowing the stack.
+- `Error` is a struct: match on `Error::kind()` (`ErrorKind`) instead of
+  `Error` variants; `Error::position()` reports the 0-based char offset
+  of the offending construct and `Display` appends `at position N`.
+- `escape()` returns `Cow<str>`, borrowing input with no
+  metacharacters (call sites using `&escape(s)` compile unchanged).
 
-### API
+### Added
 
-- `Regex::is_match` (capture-free fast path), `captures`, `as_str`,
-  `Display`, `Clone`; `escape()` returns `Cow<str>`, borrowing input
-  with no metacharacters.
-- `Captures::get` / `span` (byte offsets) / `iter` / `len` and
-  `Index<usize>`.
-- Structured errors: `Error::kind()` (`ErrorKind`) plus
-  `Error::position()` — the 0-based char offset of the offending
-  construct; `Display` appends `at position N`.
+- `Regex::is_match` (capture-free fast path), `Regex::new_ci`,
+  `as_str`, `Display`, `Clone`.
+- `Captures::span` (byte offsets), `Captures::iter`, `Index<usize>`.
+
+### Fixed
+
+- Deeply nested group patterns overflowed the parser's stack and
+  aborted the process; nesting is now capped at 250
+  (`ErrorKind::NestingTooDeep`).
 
 ### Performance
 
@@ -42,8 +40,16 @@ backend of [`rush`](https://github.com/baileyrd/rush).
 
 ### Tooling
 
-- Differential harness (2000 random cases × 4 oracles), fuzz targets
-  (parse / exec invariants / regex-crate differential) with a seeded CI
-  smoke job and a weekly unseeded deep-fuzz workflow, benchmarks vs the
-  `regex` crate, MSRV (1.75) verification, and a crates.io package
-  check in CI.
+- Fuzz targets (parse / exec invariants / regex-crate differential)
+  with a seeded CI smoke job and a weekly unseeded deep-fuzz workflow,
+  benchmarks vs the `regex` crate, MSRV (1.75) verification, and a
+  crates.io package check in CI.
+
+## [0.1.0] — 2026-07-11
+
+The original engine: POSIX-ERE parser (full grammar including bracket
+corner cases), bytecode compiler, Pike VM with captures — linear-time,
+zero dependencies, no `unsafe`. POSIX leftmost-longest mode
+(`Regex::new_posix`) and case-insensitive `REG_ICASE` mode
+(`Regex::new_posix_ci`), verified differentially against the `regex`
+crate and live bash 5.2 oracles.
