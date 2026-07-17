@@ -12,12 +12,13 @@ it in drops five crates from rush's dependency tree.
 
 ## Status
 
-✅ **Engine complete.** The parser, compiler, and Pike VM are implemented,
-including the POSIX leftmost-longest mode (`Regex::new_posix`) and the
-case-insensitive mode (`Regex::new_posix_ci`), and validated by a
-differential harness against the `regex` crate and a live bash oracle.
-Every [roadmap](DESIGN.md#roadmap) step is complete, including the rush
-integration: rush's `[[ =~ ]]` conditional runs on this engine.
+✅ **Engine complete and integrated**: rush's `[[ =~ ]]` conditional runs
+on this engine. Every construct is validated by a differential harness
+against the `regex` crate and live bash 5.2 oracles (~40k comparisons
+per run), three fuzz targets, and a benchmark suite. See
+[RELEASE_NOTES.md](RELEASE_NOTES.md) for what's new,
+[docs/FLAVORS.md](docs/FLAVORS.md) for how this dialect differs from
+PCRE, and [docs/COOKBOOK.md](docs/COOKBOOK.md) for ready-made patterns.
 
 ## Scope
 
@@ -56,7 +57,10 @@ if let Some(caps) = re.captures("release-2026") {
 Matching is an unanchored search (like bash `=~`). When only match/no-match
 is needed, `is_match` skips capture tracking entirely and is faster than
 `captures`; `find` returns just the match location, tracking group 0
-alone. `Regex::new` uses
+alone; `find_iter`/`captures_iter` walk all non-overlapping matches.
+`Regex::builder()` composes the modes and adds grep-style
+`newline(true)` line matching; `debug_dump()` shows how a pattern
+compiled and which fast path it takes. `Regex::new` uses
 leftmost-first semantics, identical to the `regex` crate. `Regex::new_posix`
 opts into POSIX leftmost-longest semantics — what real bash/glibc report:
 

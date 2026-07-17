@@ -4,7 +4,7 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.4.0] — 2026-07-17
 
 ### Breaking
 
@@ -19,7 +19,27 @@ All notable changes to this crate are documented here. The format follows
   two hand-confirmed glibc submatch nonconformances are recorded in the
   known-quirks list (group 0 always agrees).
 
+### Added
+
+- Degenerate collating symbols `[.c.]` and equivalence classes `[=c=]`
+  ([#19]): accepted as bash does, including `[[.a.]-c]` ranges;
+  `[[=a=]-c]` and multi-char collating names stay errors, as in glibc.
+- `Regex::builder()` with `posix` / `case_insensitive` / `newline`
+  options; `newline(true)` is POSIX `REG_NEWLINE` line matching ([#21]).
+- `Regex::debug_dump()`: mode, chosen execution tier, extracted
+  prefix/suffix, instruction listing; unstable output format ([#24]).
+- `docs/FLAVORS.md` (differences vs PCRE / the regex crate, each pinned
+  by a test) and `docs/COOKBOOK.md` backed by `tests/cookbook.rs`
+  ([#22], [#23]); `docs/GLOB_DESIGN.md` proposal ([#20]);
+  `RELEASE_NOTES.md`.
+
 [#18]: https://github.com/baileyrd/rusty_regx/issues/18
+[#19]: https://github.com/baileyrd/rusty_regx/issues/19
+[#20]: https://github.com/baileyrd/rusty_regx/issues/20
+[#21]: https://github.com/baileyrd/rusty_regx/issues/21
+[#22]: https://github.com/baileyrd/rusty_regx/issues/22
+[#23]: https://github.com/baileyrd/rusty_regx/issues/23
+[#24]: https://github.com/baileyrd/rusty_regx/issues/24
 
 ## [0.3.0] — 2026-07-17
 
