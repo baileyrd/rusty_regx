@@ -5,10 +5,30 @@
 //! POSIX classes `[[:alpha:]]`…`[[:xdigit:]]`. Malformed intervals are
 //! errors (`{,}`, `{a}`, `{3,2}`), per DESIGN.md.
 //!
+//! GNU extensions (bash's `regcomp` is glibc, and real scripts rely on
+//! these; each verified against bash 5.2):
+//!
+//! - `\w` `\W` = (non-)word char (`[[:alnum:]_]`), `\s` `\S` =
+//!   (non-)whitespace (`[[:space:]]`) — outside brackets only (inside,
+//!   POSIX's literal-backslash rule applies, as in glibc).
+//! - `\b` `\B` word boundary / non-boundary, `\<` `\>` word start/end.
+//!   Quantifying one directly is an error, as in glibc.
+//! - `` \` `` and `\'` = start/end of input.
+//! - `{,n}` = `{0,n}`, and `{,}` = `*`.
+//!
+//! GNU extensions (bash's `regcomp` is glibc, and real scripts rely on
+//! these; each verified against bash 5.2): `\w` `\W` (word chars,
+//! `[[:alnum:]_]`), `\s` `\S` (`[[:space:]]`), `\b` `\B` word
+//! boundary/non-boundary, `\<` `\>` word start/end (quantifying an
+//! assertion directly is an error, as in glibc), `` \` `` `\'` input
+//! start/end, and `{,n}` = `{0,n}` (so `{,}` = `*`). Outside this set,
+//! `\c` stays a literal `c` (`\d` is a literal `d`, as in glibc); inside
+//! brackets the POSIX literal-backslash rule still applies.
+//!
 //! Deliberate choices where POSIX leaves behavior undefined:
 //!
-//! - `\c` outside brackets makes `c` literal for any `c`; a lone trailing
-//!   `\` is an error.
+//! - `\c` outside brackets makes any *other* `c` literal (so `\d` is a
+//!   literal `d`, as in glibc); a lone trailing `\` is an error.
 //! - Inside a bracket expression, `\` is a literal backslash (POSIX rule;
 //!   this matches bash/glibc, not the `regex` crate).
 //! - `^` and `$` are anchors anywhere in the pattern, and atoms (including
@@ -49,6 +69,35 @@ pub fn parse(pattern: &str) -> Result<Ast, Error> {
         ));
     }
     Ok(ast)
+}
+
+/// glibc rejects a quantifier directly on a word assertion (`\b*` is a
+/// compile error in bash); `^`/`$` stay quantifiable as before.
+fn reject_quantified_assertion(ast: &Ast, at: usize) -> Result<(), Error> {
+    match ast {
+        Ast::WordBoundary | Ast::NotWordBoundary | Ast::WordStart | Ast::WordEnd => {
+            Err(Error::new(ErrorKind::DanglingQuantifier, Some(at)))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `\w`/`\W`: glibc's word class, `[[:alnum:]_]` (optionally negated).
+fn word_class(negated: bool) -> Ast {
+    Ast::Class(Class {
+        negated,
+        ranges: vec![('_', '_')],
+        posix: vec![PosixClass::Alnum],
+    })
+}
+
+/// `\s`/`\S`: `[[:space:]]` (optionally negated).
+fn space_class(negated: bool) -> Ast {
+    Ast::Class(Class {
+        negated,
+        ranges: Vec::new(),
+        posix: vec![PosixClass::Space],
+    })
 }
 
 /// Iterates the pattern `&str` directly — no up-front `Vec<char>`
@@ -123,6 +172,7 @@ impl Parser<'_> {
                     let ast = items
                         .pop()
                         .ok_or(Error::new(ErrorKind::DanglingQuantifier, Some(at)))?;
+                    reject_quantified_assertion(&ast, at)?;
                     items.push(Ast::Repeat {
                         ast: Box::new(ast),
                         min,
@@ -147,6 +197,7 @@ impl Parser<'_> {
         let ast = items
             .pop()
             .ok_or(Error::new(ErrorKind::DanglingQuantifier, Some(at)))?;
+        reject_quantified_assertion(&ast, at)?;
         items.push(Ast::Repeat {
             ast: Box::new(ast),
             min,
@@ -178,6 +229,17 @@ impl Parser<'_> {
             '^' => Ok(Ast::StartAnchor),
             '$' => Ok(Ast::EndAnchor),
             '\\' => match self.bump() {
+                // GNU extensions (glibc regcomp; what bash =~ accepts).
+                Some('w') => Ok(word_class(false)),
+                Some('W') => Ok(word_class(true)),
+                Some('s') => Ok(space_class(false)),
+                Some('S') => Ok(space_class(true)),
+                Some('b') => Ok(Ast::WordBoundary),
+                Some('B') => Ok(Ast::NotWordBoundary),
+                Some('<') => Ok(Ast::WordStart),
+                Some('>') => Ok(Ast::WordEnd),
+                Some('`') => Ok(Ast::StartAnchor),
+                Some('\'') => Ok(Ast::EndAnchor),
                 Some(c) => Ok(Ast::Char(c)),
                 None => Err(Error::new(
                     ErrorKind::TrailingBackslash,
@@ -193,7 +255,12 @@ impl Parser<'_> {
         let open = self.char_pos;
         let err = || Error::new(ErrorKind::InvalidInterval, Some(open));
         self.bump();
-        let min = self.integer(open)?;
+        // GNU: `{,n}` means `{0,n}` (and `{,}` means `*`), as in glibc.
+        let min = if self.peek() == Some(',') {
+            0
+        } else {
+            self.integer(open)?
+        };
         if self.eat('}') {
             return Ok((min, Some(min)));
         }
@@ -463,14 +530,15 @@ mod tests {
         assert_eq!(parse("a{3,}"), Ok(repeat(ch('a'), 3, None)));
         assert_eq!(parse("a{3,5}"), Ok(repeat(ch('a'), 3, Some(5))));
         assert_eq!(parse("a{0,0}"), Ok(repeat(ch('a'), 0, Some(0))));
+        // GNU: an omitted minimum is 0 (bash-verified).
+        assert_eq!(parse("a{,3}"), Ok(repeat(ch('a'), 0, Some(3))));
+        assert_eq!(parse("a{,}"), Ok(repeat(ch('a'), 0, None)));
     }
 
     #[test]
     fn bad_intervals() {
         for pattern in [
             "a{}",
-            "a{,}",
-            "a{,3}",
             "a{x}",
             "a{3,x}",
             "a{3,2}",

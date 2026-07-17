@@ -26,10 +26,11 @@ POSIX ERE, nothing more:
 | Supported | Not supported (by design) |
 | --- | --- |
 | Alternation `\|`, capturing groups `( )` | Backreferences, lookaround |
-| Quantifiers `* + ?`, intervals `{m} {m,} {m,n}` | Lazy/possessive quantifiers |
-| Anchors `^ $`, any-char `.`, escaped metachars | Named groups, Perl classes (`\d` `\w` `\b`) |
-| Bracket expressions incl. `[^…]`, ranges, `[]a]`, `[a-]` | Unicode property classes |
+| Quantifiers `* + ?`, intervals `{m} {m,} {m,n}` (GNU `{,n}`) | Lazy/possessive quantifiers |
+| Anchors `^ $`, any-char `.`, escaped metachars | Named groups, Unicode property classes |
+| Bracket expressions incl. `[^…]`, ranges, `[]a]`, `[a-]` | `\d` and other Perl-only escapes (literal, as in glibc) |
 | POSIX classes `[[:alpha:]]` … `[[:xdigit:]]` | Replacement APIs, streaming |
+| GNU extensions (as glibc/bash): `\w \W \s \S`, `\b \B \< \>`, `` \` `` `\'` | |
 
 ## Why no backtracking?
 

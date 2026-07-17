@@ -78,9 +78,19 @@ const CLASSES_CI: &[&str] = &[
 const LETTERS: &[u8] = b"abc01 ";
 const LETTERS_CI: &[u8] = b"abcABC01 ";
 
-// Escaped metacharacters only: escapes like `\a` mean a literal `a` in
-// POSIX ERE but the BEL control character to the regex crate.
-const ESCAPES: &[&str] = &["\\.", "\\*", "\\+", "\\?", "\\(", "\\)", "\\[", "\\|"];
+// Escaped metacharacters, plus the GNU class escapes — a literal `a` in
+// POSIX ERE would be BEL to the regex crate, so only metachars and the
+// GNU set (which the crate agrees on over ASCII) are generated.
+const ESCAPES: &[&str] = &[
+    "\\.", "\\*", "\\+", "\\?", "\\(", "\\)", "\\[", "\\|", "\\w", "\\W", "\\s", "\\S",
+];
+
+// Zero-width word assertions. Never quantified by the generator: glibc
+// rejects a quantifier directly on one (verified against bash 5.2).
+// The regex crate supports \b/\B (Unicode-aware, but identical over
+// ASCII); \< and \> are glibc-only, so only the bash oracles get them.
+const ASSERTS_CRATE: &[&str] = &["\\b", "\\B"];
+const ASSERTS_GNU: &[&str] = &["\\b", "\\B", "\\<", "\\>"];
 
 /// `quant` — may this level carry quantifiers? The bash oracle sets it to
 /// false inside groups: glibc's regexec (what bash uses) goes superlinear
@@ -92,10 +102,11 @@ struct Gen {
     nested_quant: bool,
     letters: &'static [u8],
     classes: &'static [&'static str],
+    asserts: &'static [&'static str],
 }
 
 fn gen_atom(rng: &mut Rng, depth: u32, g: Gen) -> String {
-    match rng.below(if depth > 0 { 12 } else { 10 }) {
+    match rng.below(if depth > 0 { 13 } else { 11 }) {
         0..=4 => {
             let c = g.letters[rng.below(g.letters.len() as u32) as usize] as char;
             c.to_string()
@@ -103,6 +114,10 @@ fn gen_atom(rng: &mut Rng, depth: u32, g: Gen) -> String {
         5 => ".".to_string(),
         6 | 7 => g.classes[rng.below(g.classes.len() as u32) as usize].to_string(),
         8 | 9 => ESCAPES[rng.below(ESCAPES.len() as u32) as usize].to_string(),
+        10 if !g.asserts.is_empty() => {
+            g.asserts[rng.below(g.asserts.len() as u32) as usize].to_string()
+        }
+        10 => ".".to_string(),
         _ => {
             let inner = Gen {
                 quant: g.nested_quant,
@@ -115,7 +130,8 @@ fn gen_atom(rng: &mut Rng, depth: u32, g: Gen) -> String {
 
 fn gen_piece(rng: &mut Rng, depth: u32, g: Gen) -> String {
     let atom = gen_atom(rng, depth, g);
-    if !g.quant {
+    // Quantifying an assertion directly is a glibc compile error.
+    if !g.quant || g.asserts.contains(&atom.as_str()) {
         return atom;
     }
     let quant = match rng.below(10) {
@@ -150,8 +166,8 @@ fn gen_alternation(rng: &mut Rng, depth: u32, g: Gen) -> String {
 }
 
 /// A full pattern: an alternation, optionally anchored at either end.
-fn gen_pattern(rng: &mut Rng, nested_quant: bool) -> String {
-    gen_pattern_over(rng, nested_quant, LETTERS, CLASSES)
+fn gen_pattern(rng: &mut Rng, nested_quant: bool, asserts: &'static [&'static str]) -> String {
+    gen_pattern_over(rng, nested_quant, LETTERS, CLASSES, asserts)
 }
 
 fn gen_pattern_over(
@@ -159,12 +175,14 @@ fn gen_pattern_over(
     nested_quant: bool,
     letters: &'static [u8],
     classes: &'static [&'static str],
+    asserts: &'static [&'static str],
 ) -> String {
     let g = Gen {
         quant: true,
         nested_quant,
         letters,
         classes,
+        asserts,
     };
     let mut p = gen_alternation(rng, 2, g);
     if rng.below(4) == 0 {
@@ -196,7 +214,7 @@ const TEXTS_PER_PATTERN: u32 = 4;
 fn differential_against_regex_crate() {
     let mut rng = Rng(0x5EED_CAFE_F00D_0001);
     for case in 0..CASES {
-        let pattern = gen_pattern(&mut rng, true);
+        let pattern = gen_pattern(&mut rng, true, ASSERTS_CRATE);
         let ours = Regex::new(&pattern)
             .unwrap_or_else(|e| panic!("case {case}: we rejected {pattern:?}: {e}"));
         let theirs = regex::Regex::new(&pattern)
@@ -318,7 +336,7 @@ fn differential_against_bash_oracle() {
     let mut cases = Vec::new();
     let mut input = String::new();
     for _ in 0..CASES {
-        let pattern = gen_pattern(&mut rng, false);
+        let pattern = gen_pattern(&mut rng, false, ASSERTS_GNU);
         let text = gen_text(&mut rng);
         input.push_str(&pattern);
         input.push('\n');
@@ -363,7 +381,7 @@ fn differential_against_bash_oracle() {
 fn differential_ci_against_regex_crate() {
     let mut rng = Rng(0xC1CA_5ED1_FF00_0005);
     for case in 0..CASES {
-        let pattern = gen_pattern_over(&mut rng, true, LETTERS_CI, CLASSES_CI);
+        let pattern = gen_pattern_over(&mut rng, true, LETTERS_CI, CLASSES_CI, ASSERTS_CRATE);
         let ours = Regex::new_ci(&pattern)
             .unwrap_or_else(|e| panic!("case {case}: we rejected {pattern:?}: {e}"));
         let wrapped = format!("(?i:{pattern})");
@@ -444,7 +462,7 @@ fn differential_posix_captures_against_bash_oracle() {
     let mut cases = Vec::new();
     let mut input = String::new();
     for _ in 0..CASES {
-        let pattern = gen_pattern(&mut rng, false);
+        let pattern = gen_pattern(&mut rng, false, ASSERTS_GNU);
         let text = gen_text(&mut rng);
         input.push_str(&pattern);
         input.push('\n');
@@ -529,7 +547,7 @@ fn differential_posix_ci_captures_against_bash_oracle() {
     let mut cases = Vec::new();
     let mut input = String::new();
     for _ in 0..CASES {
-        let pattern = gen_pattern_over(&mut rng, false, LETTERS_CI, CLASSES_CI);
+        let pattern = gen_pattern_over(&mut rng, false, LETTERS_CI, CLASSES_CI, ASSERTS_GNU);
         let text = gen_text_over(&mut rng, b"aAbBcC0123dDeEf .-");
         input.push_str(&pattern);
         input.push('\n');
@@ -582,6 +600,24 @@ fn differential_posix_ci_captures_against_bash_oracle() {
 /// engine follows POSIX). Divergent cases confirmed by hand go here so the
 /// harness stays exact everywhere else.
 fn known_glibc_submatch_quirk(pattern: &str, text: &str) -> bool {
-    const KNOWN_GLIBC_SUBMATCH_QUIRKS: &[(&str, &str)] = &[];
+    const KNOWN_GLIBC_SUBMATCH_QUIRKS: &[(&str, &str)] = &[
+        // Under nocasematch, glibc reports the final `+` iteration as "C"
+        // (the short `[[:lower:]]` alternative) where POSIX requires the
+        // longest iteration "aAC" (`[[:lower:]][^X-Z].`). Group 0 agrees
+        // ("daAC"); hand-confirmed against bash 5.2.
+        (
+            r"^0*\[[[:lower:]]+|([[:lower:]]b|([[:lower:]][^X-Z].|[[:lower:]]))+|[[:digit:]]{3}(\)a |.|[A-F0-3]b)A*.",
+            " daAC",
+        ),
+        // Full-tie branch choice: both the 2nd and 3rd alternatives span
+        // "AcEd0"; every tag comparison is participating-vs-absent (a tie
+        // under the POSIX pre-order rule), so we keep the earlier branch
+        // (group 2 absent) while glibc reports the later one's group 2 =
+        // "0". Hand-confirmed against bash 5.2.
+        (
+            r"c+  \+{0,1}|.{2,4}(1Cc)*\w{0,1}\>|.+.?(.|.\S.[A-]|0\*){3}",
+            "AcEd0",
+        ),
+    ];
     KNOWN_GLIBC_SUBMATCH_QUIRKS.contains(&(pattern, text))
 }

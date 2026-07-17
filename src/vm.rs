@@ -49,6 +49,13 @@ fn literal_span(lit: &Literal, text: &str, from: usize) -> Option<(usize, usize)
     }
 }
 
+/// glibc's word character for `\b`/`\w`-family assertions:
+/// `[[:alnum:]_]`, with this crate's documented Unicode-locale stance on
+/// `alnum`. `None` (text edge) is never a word char.
+fn is_word(c: Option<char>) -> bool {
+    c.is_some_and(|c| c.is_alphanumeric() || c == '_')
+}
+
 /// The scan fast-forward search: a plain substring search, or — in
 /// `icase` mode, where the prefix chars are pre-folded at compile time —
 /// a fold-and-compare scan. The folded scan is O(len * prefix) worst
@@ -116,7 +123,11 @@ fn step(program: &Program, pc: usize, c: Option<char>, fc: Option<char>) -> Step
         | Inst::Jump(_)
         | Inst::Save(_)
         | Inst::StartAnchor
-        | Inst::EndAnchor => unreachable!("epsilon inst in thread list"),
+        | Inst::EndAnchor
+        | Inst::WordBoundary
+        | Inst::NotWordBoundary
+        | Inst::WordStart
+        | Inst::WordEnd => unreachable!("epsilon inst in thread list"),
     }
 }
 
@@ -202,8 +213,13 @@ pub fn exec(
     *gen += 1;
     let mut matched: Option<Slots> = None;
 
+    // Word-boundary assertions need the chars adjacent to the position.
+    let prev0 = text[..from].chars().next_back();
+    let next0 = text[from..].chars().next();
     let initial = Rc::new(vec![None; slot_limit.min(program.slot_count)]);
-    add_thread(program, clist, visited, *gen, stack, 0, initial, from, len);
+    add_thread(
+        program, clist, visited, *gen, stack, 0, initial, from, len, prev0, next0,
+    );
     // The thread state a scan (re)starts from; used by the fast-forward
     // check below. Captured at `from`: for `from == 0`, a pattern with an
     // anchored head branch shrinks its restart set afterwards, so the
@@ -233,6 +249,8 @@ pub fn exec(
                         Rc::new(vec![None; slot_limit.min(program.slot_count)]),
                         pos,
                         len,
+                        text[..pos].chars().next_back(),
+                        text[pos..].chars().next(),
                     );
                 }
                 // The required prefix never occurs again: no match.
@@ -244,6 +262,9 @@ pub fn exec(
         // The pattern side was folded at compile time; fold the input to
         // match. Positions (and so captures) always use the original text.
         let fc = if program.icase { c.map(fold) } else { c };
+        // At next_pos, the previous char is `c`; look one char ahead for
+        // the word-boundary assertions.
+        let next_c = text[next_pos..].chars().next();
         *gen += 1;
         nlist.clear();
         for (pc, slots) in clist.drain(..) {
@@ -258,6 +279,8 @@ pub fn exec(
                     slots,
                     next_pos,
                     len,
+                    c,
+                    next_c,
                 ),
                 Step::Die => {}
                 Step::Matched => {
@@ -306,6 +329,8 @@ fn add_thread(
     slots: Slots,
     pos: usize,
     len: usize,
+    prev: Option<char>,
+    next: Option<char>,
 ) {
     debug_assert!(stack.is_empty());
     stack.push((pc, slots));
@@ -336,6 +361,26 @@ fn add_thread(
             }
             Inst::EndAnchor => {
                 if pos == len {
+                    stack.push((pc + 1, slots));
+                }
+            }
+            Inst::WordBoundary => {
+                if is_word(prev) != is_word(next) {
+                    stack.push((pc + 1, slots));
+                }
+            }
+            Inst::NotWordBoundary => {
+                if is_word(prev) == is_word(next) {
+                    stack.push((pc + 1, slots));
+                }
+            }
+            Inst::WordStart => {
+                if !is_word(prev) && is_word(next) {
+                    stack.push((pc + 1, slots));
+                }
+            }
+            Inst::WordEnd => {
+                if is_word(prev) && !is_word(next) {
                     stack.push((pc + 1, slots));
                 }
             }
@@ -373,7 +418,11 @@ pub fn exec_bool(program: &Program, text: &str, from: usize, scratch: &mut Scrat
     clist.clear();
     nlist.clear();
     *gen += 1;
-    add_thread_bool(program, clist, visited, *gen, stack, 0, from, len);
+    let prev0 = text[..from].chars().next_back();
+    let next0 = text[from..].chars().next();
+    add_thread_bool(
+        program, clist, visited, *gen, stack, 0, from, len, prev0, next0,
+    );
     // Boolean threads are bare pcs, so pc-list equality with the restart
     // state is exact state equality — see the fast-forward note in `exec`.
     let restart: Vec<usize> = clist.clone();
@@ -390,13 +439,23 @@ pub fn exec_bool(program: &Program, text: &str, from: usize, scratch: &mut Scrat
         let c = text[pos..].chars().next();
         let next_pos = pos + c.map_or(0, char::len_utf8);
         let fc = if program.icase { c.map(fold) } else { c };
+        let next_c = text[next_pos..].chars().next();
         *gen += 1;
         nlist.clear();
         for pc in clist.drain(..) {
             match step(program, pc, c, fc) {
-                Step::Advance => {
-                    add_thread_bool(program, nlist, visited, *gen, stack, pc + 1, next_pos, len)
-                }
+                Step::Advance => add_thread_bool(
+                    program,
+                    nlist,
+                    visited,
+                    *gen,
+                    stack,
+                    pc + 1,
+                    next_pos,
+                    len,
+                    c,
+                    next_c,
+                ),
                 Step::Die => {}
                 Step::Matched => return true,
             }
@@ -420,6 +479,8 @@ fn add_thread_bool(
     pc: usize,
     pos: usize,
     len: usize,
+    prev: Option<char>,
+    next: Option<char>,
 ) {
     debug_assert!(stack.is_empty());
     stack.push(pc);
@@ -442,6 +503,26 @@ fn add_thread_bool(
             }
             Inst::EndAnchor => {
                 if pos == len {
+                    stack.push(pc + 1);
+                }
+            }
+            Inst::WordBoundary => {
+                if is_word(prev) != is_word(next) {
+                    stack.push(pc + 1);
+                }
+            }
+            Inst::NotWordBoundary => {
+                if is_word(prev) == is_word(next) {
+                    stack.push(pc + 1);
+                }
+            }
+            Inst::WordStart => {
+                if !is_word(prev) && is_word(next) {
+                    stack.push(pc + 1);
+                }
+            }
+            Inst::WordEnd => {
+                if is_word(prev) && !is_word(next) {
                     stack.push(pc + 1);
                 }
             }
@@ -489,9 +570,11 @@ pub fn exec_posix(
     *gen += 1;
     let mut best_match: Option<Slots> = None;
 
+    let prev0 = text[..from].chars().next_back();
+    let next0 = text[from..].chars().next();
     let initial = Rc::new(vec![None; slot_limit.min(program.slot_count)]);
     closure_posix(
-        program, best, best_gen, *gen, order, stack, 0, initial, from, len,
+        program, best, best_gen, *gen, order, stack, 0, initial, from, len, prev0, next0,
     );
     harvest(best, order, clist);
     // See the fast-forward note in `exec`.
@@ -517,6 +600,8 @@ pub fn exec_posix(
                         Rc::new(vec![None; slot_limit.min(program.slot_count)]),
                         pos,
                         len,
+                        text[..pos].chars().next_back(),
+                        text[pos..].chars().next(),
                     );
                     harvest(best, order, clist);
                 }
@@ -526,6 +611,7 @@ pub fn exec_posix(
         let c = text[pos..].chars().next();
         let next_pos = pos + c.map_or(0, char::len_utf8);
         let fc = if program.icase { c.map(fold) } else { c };
+        let next_c = text[next_pos..].chars().next();
         // Closures during this drain run under a fresh generation; a
         // harvest never shares a generation with a later closure, so a
         // taken (`None`) entry can never be mistaken for a live claim.
@@ -543,6 +629,8 @@ pub fn exec_posix(
                     slots,
                     next_pos,
                     len,
+                    c,
+                    next_c,
                 ),
                 Step::Die => {}
                 Step::Matched => {
@@ -600,6 +688,8 @@ fn closure_posix(
     slots: Slots,
     pos: usize,
     len: usize,
+    prev: Option<char>,
+    next: Option<char>,
 ) {
     debug_assert!(stack.is_empty());
     stack.push((pc, slots));
@@ -641,6 +731,26 @@ fn closure_posix(
             }
             Inst::EndAnchor => {
                 if pos == len {
+                    stack.push((pc + 1, slots));
+                }
+            }
+            Inst::WordBoundary => {
+                if is_word(prev) != is_word(next) {
+                    stack.push((pc + 1, slots));
+                }
+            }
+            Inst::NotWordBoundary => {
+                if is_word(prev) == is_word(next) {
+                    stack.push((pc + 1, slots));
+                }
+            }
+            Inst::WordStart => {
+                if !is_word(prev) && is_word(next) {
+                    stack.push((pc + 1, slots));
+                }
+            }
+            Inst::WordEnd => {
+                if is_word(prev) && !is_word(next) {
                     stack.push((pc + 1, slots));
                 }
             }
