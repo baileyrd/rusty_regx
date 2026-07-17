@@ -85,6 +85,16 @@ let caps = re.captures("ABC").unwrap();
 assert_eq!(caps.get(1), Some("A")); // captures keep the original case
 ```
 
+## POSIX classes and locales
+
+POSIX classes use Rust `char` semantics where they have a sensible Unicode
+meaning (no Unicode tables are bundled): `[[:alpha:]]` matches `é`,
+`[[:space:]]` matches U+00A0. This is what glibc does in a UTF-8 locale,
+but **not** in the `C` locale, where classes are ASCII-only — so
+`[[ é =~ [[:alpha:]] ]]` succeeds here and in a UTF-8 bash, yet fails
+under `LC_ALL=C`. rush runs UTF-8-first, so this engine deliberately sides
+with the UTF-8 behavior; the divergence is pinned by tests.
+
 See [DESIGN.md](DESIGN.md) for the architecture and full roadmap.
 
 ## License

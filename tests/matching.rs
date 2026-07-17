@@ -139,6 +139,25 @@ fn dot_and_utf8() {
     assert_eq!(find("é+", "ééé"), Some("ééé"));
 }
 
+/// Pins the *intended* divergence from the `C` locale (see README):
+/// POSIX classes use Unicode `char` fallbacks, matching glibc in a UTF-8
+/// locale — not `LC_ALL=C`, where classes are ASCII-only. If one of these
+/// assertions starts failing, the engine's locale stance changed.
+#[test]
+fn posix_classes_are_unicode_not_c_locale() {
+    // Matches here and in UTF-8 bash; fails in bash under LC_ALL=C.
+    assert_eq!(find("[[:alpha:]]+", "héllo"), Some("héllo"));
+    assert_eq!(find("[[:alnum:]]", "×é×"), Some("é"));
+    assert_eq!(find("[[:space:]]", "a\u{a0}b"), Some("\u{a0}"));
+    assert_eq!(find("[[:lower:]]+", "σφ"), Some("σφ"));
+    assert_eq!(find("[[:upper:]]+", "ΣΦ"), Some("ΣΦ"));
+    // ASCII-first classes stay ASCII-only in every locale: digit, xdigit,
+    // blank, graph, print, punct never took the Unicode fallback.
+    assert_eq!(find("[[:digit:]]", "٣"), None); // Arabic-Indic three
+    assert_eq!(find("[[:xdigit:]]", "ａ"), None); // fullwidth a
+    assert_eq!(find("[[:punct:]]", "«"), None);
+}
+
 #[test]
 fn rush_shaped_patterns() {
     // The kinds of patterns rush's C56 conditional exercises.
