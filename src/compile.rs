@@ -43,14 +43,74 @@ pub enum Inst {
     Match,
 }
 
+/// A compiled bracket expression: ASCII membership precomputed as a
+/// 128-bit table (negation and POSIX classes folded in — one bit test
+/// per input char on the VM's hottest path), with the general
+/// range/POSIX logic as the non-ASCII fallback.
+#[derive(Debug, Clone)]
+pub struct CompiledClass {
+    ascii: [u64; 2],
+    class: Class,
+}
+
+impl CompiledClass {
+    fn new(class: Class) -> CompiledClass {
+        let mut ascii = [0u64; 2];
+        for b in 0..128u32 {
+            let c = char::from_u32(b).expect("ASCII");
+            if class_matches_general(&class, c) {
+                ascii[(b / 64) as usize] |= 1 << (b % 64);
+            }
+        }
+        CompiledClass { ascii, class }
+    }
+
+    /// Whether `c` is in the class.
+    pub fn matches(&self, c: char) -> bool {
+        let b = c as u32;
+        if b < 128 {
+            self.ascii[(b / 64) as usize] & (1 << (b % 64)) != 0
+        } else {
+            class_matches_general(&self.class, c)
+        }
+    }
+}
+
+/// The general membership test: binary search over the compile-time
+/// sorted-and-merged ranges (see `normalize_ranges`), then the POSIX
+/// classes, then negation.
+fn class_matches_general(class: &Class, c: char) -> bool {
+    let i = class.ranges.partition_point(|&(lo, _)| lo <= c);
+    let hit =
+        (i > 0 && class.ranges[i - 1].1 >= c) || class.posix.iter().any(|&p| posix_matches(p, c));
+    hit != class.negated
+}
+
+/// POSIX classes are ASCII-first, with `char` method fallbacks where they
+/// have a sensible Unicode meaning (per DESIGN.md — no Unicode tables).
+fn posix_matches(class: PosixClass, c: char) -> bool {
+    match class {
+        PosixClass::Alnum => c.is_alphanumeric(),
+        PosixClass::Alpha => c.is_alphabetic(),
+        PosixClass::Blank => c == ' ' || c == '\t',
+        PosixClass::Cntrl => c.is_control(),
+        PosixClass::Digit => c.is_ascii_digit(),
+        PosixClass::Graph => c.is_ascii_graphic(),
+        PosixClass::Lower => c.is_lowercase(),
+        PosixClass::Print => c.is_ascii_graphic() || c == ' ',
+        PosixClass::Punct => c.is_ascii_punctuation(),
+        PosixClass::Space => c.is_whitespace(),
+        PosixClass::Upper => c.is_uppercase(),
+        PosixClass::Xdigit => c.is_ascii_hexdigit(),
+    }
+}
+
 /// A compiled program.
 #[derive(Debug, Clone)]
 pub struct Program {
     pub insts: Vec<Inst>,
     /// Interned bracket expressions, referenced by `Inst::Class` index.
-    /// Ranges are normalized at compile time: sorted by start and merged,
-    /// so the VM can binary-search them.
-    pub classes: Vec<Class>,
+    pub classes: Vec<CompiledClass>,
     /// Number of capture groups including group 0.
     pub group_count: usize,
     /// Total `Save` slots: two per group, plus two per repetition (hidden
@@ -303,7 +363,7 @@ fn max_group(ast: &Ast) -> u32 {
 
 struct Compiler {
     insts: Vec<Inst>,
-    classes: Vec<Class>,
+    classes: Vec<CompiledClass>,
     icase: bool,
 }
 
@@ -353,7 +413,7 @@ impl Compiler {
                 let mut class = self.fold_class(class)?;
                 normalize_ranges(&mut class.ranges);
                 let index = self.classes.len();
-                self.classes.push(class);
+                self.classes.push(CompiledClass::new(class));
                 self.push(Inst::Class(index))?;
             }
             Ast::StartAnchor => {

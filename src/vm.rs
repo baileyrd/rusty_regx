@@ -22,7 +22,6 @@
 //! group in index order — the classic leftmost-longest approximation used
 //! by RE2's POSIX mode, matching what bash/glibc report.
 
-use crate::ast::{Class, PosixClass};
 use crate::compile::{fold, Inst, Literal, Program};
 use std::rc::Rc;
 
@@ -64,9 +63,7 @@ fn step(program: &Program, pc: usize, c: Option<char>, fc: Option<char>) -> Step
     match program.insts[pc] {
         Inst::Char(x) if fc == Some(x) => Step::Advance,
         Inst::AnyChar if c.is_some() => Step::Advance,
-        Inst::Class(i) if fc.is_some_and(|ch| class_matches(&program.classes[i], ch)) => {
-            Step::Advance
-        }
+        Inst::Class(i) if fc.is_some_and(|ch| program.classes[i].matches(ch)) => Step::Advance,
         Inst::Char(_) | Inst::AnyChar | Inst::Class(_) => Step::Die,
         Inst::Match => Step::Matched,
         // Epsilon instructions are resolved inside the closures.
@@ -598,32 +595,4 @@ fn posix_better(program: &Program, a: &Slots, b: &Slots) -> bool {
         }
     }
     false
-}
-
-/// Ranges are compile-time sorted and merged (see `normalize_ranges`), so
-/// membership is a binary search.
-fn class_matches(class: &Class, c: char) -> bool {
-    let i = class.ranges.partition_point(|&(lo, _)| lo <= c);
-    let hit =
-        (i > 0 && class.ranges[i - 1].1 >= c) || class.posix.iter().any(|&p| posix_matches(p, c));
-    hit != class.negated
-}
-
-/// POSIX classes are ASCII-first, with `char` method fallbacks where they
-/// have a sensible Unicode meaning (per DESIGN.md — no Unicode tables).
-fn posix_matches(class: PosixClass, c: char) -> bool {
-    match class {
-        PosixClass::Alnum => c.is_alphanumeric(),
-        PosixClass::Alpha => c.is_alphabetic(),
-        PosixClass::Blank => c == ' ' || c == '\t',
-        PosixClass::Cntrl => c.is_control(),
-        PosixClass::Digit => c.is_ascii_digit(),
-        PosixClass::Graph => c.is_ascii_graphic(),
-        PosixClass::Lower => c.is_lowercase(),
-        PosixClass::Print => c.is_ascii_graphic() || c == ' ',
-        PosixClass::Punct => c.is_ascii_punctuation(),
-        PosixClass::Space => c.is_whitespace(),
-        PosixClass::Upper => c.is_uppercase(),
-        PosixClass::Xdigit => c.is_ascii_hexdigit(),
-    }
 }
