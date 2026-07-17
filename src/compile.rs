@@ -6,10 +6,10 @@
 //! cannot blow up the program size.
 
 use crate::ast::{Ast, Class, PosixClass};
-use crate::error::Error;
+use crate::error::{Error, ErrorKind};
 
 /// Cap on a single interval bound, mirroring the `regex` crate's limit in
-/// spirit. Exceeding it yields [`Error::RepetitionTooLarge`].
+/// spirit. Exceeding it yields [`ErrorKind::RepetitionTooLarge`].
 pub const MAX_REPETITION_SIZE: u32 = 1000;
 
 /// Cap on total compiled program size, so nested intervals like
@@ -168,7 +168,7 @@ impl Compiler {
     /// Appends an instruction, returning its index; errors past the size cap.
     fn push(&mut self, inst: Inst) -> Result<usize, Error> {
         if self.insts.len() >= MAX_PROGRAM_SIZE {
-            return Err(Error::RepetitionTooLarge);
+            return Err(Error::new(ErrorKind::RepetitionTooLarge, None));
         }
         self.insts.push(inst);
         Ok(self.insts.len() - 1)
@@ -235,7 +235,7 @@ impl Compiler {
         for &(lo, hi) in &class.ranges {
             let (lo, hi) = (fold(lo), fold(hi));
             if lo > hi {
-                return Err(Error::InvalidRange);
+                return Err(Error::new(ErrorKind::InvalidRange, None));
             }
             ranges.push((lo, hi));
         }
@@ -300,7 +300,7 @@ impl Compiler {
     /// not "") — which is exactly what sharing the body tail achieves.
     fn repeat(&mut self, ast: &Ast, min: u32, max: Option<u32>, slot: usize) -> Result<(), Error> {
         if min > MAX_REPETITION_SIZE || max.is_some_and(|m| m > MAX_REPETITION_SIZE) {
-            return Err(Error::RepetitionTooLarge);
+            return Err(Error::new(ErrorKind::RepetitionTooLarge, None));
         }
         // Hidden span tags around the whole construct (see `number`).
         self.push(Inst::Save(slot))?;

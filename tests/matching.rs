@@ -1,7 +1,7 @@
 //! End-to-end matching tests through the public API, including the
 //! adversarial linear-time tests required by DESIGN.md from day one.
 
-use rusty_regx::{Error, Regex};
+use rusty_regx::{ErrorKind, Regex};
 
 /// Group 0 of the leftmost match, or None.
 fn find<'t>(pattern: &str, text: &'t str) -> Option<&'t str> {
@@ -202,7 +202,10 @@ fn new_ci_is_leftmost_first_and_case_insensitive() {
     );
     // Same folding rules as new_posix_ci.
     assert!(Regex::new_ci("[X-Z]").unwrap().is_match("y"));
-    assert_eq!(Regex::new_ci("[Z-a]").unwrap_err(), Error::InvalidRange);
+    assert_eq!(
+        Regex::new_ci("[Z-a]").unwrap_err().kind(),
+        ErrorKind::InvalidRange
+    );
 }
 
 #[test]
@@ -229,13 +232,13 @@ fn groups_of(re: &Regex, text: &str) -> Option<Vec<Option<String>>> {
 #[test]
 fn repetition_size_limits() {
     assert_eq!(
-        Regex::new("a{1001}").unwrap_err(),
-        Error::RepetitionTooLarge
+        Regex::new("a{1001}").unwrap_err().kind(),
+        ErrorKind::RepetitionTooLarge
     );
     // Within the per-interval cap but past the program-size cap.
     assert_eq!(
-        Regex::new("(a{1000}){1000}").unwrap_err(),
-        Error::RepetitionTooLarge
+        Regex::new("(a{1000}){1000}").unwrap_err().kind(),
+        ErrorKind::RepetitionTooLarge
     );
     assert!(Regex::new("a{1000}").is_ok());
 }
@@ -364,8 +367,8 @@ fn posix_ci_range_reversed_after_folding_is_an_error() {
     // bash rejects it under nocasematch (exit 2 from `=~`).
     assert!(Regex::new_posix("[Z-a]").is_ok());
     assert_eq!(
-        Regex::new_posix_ci("[Z-a]").unwrap_err(),
-        Error::InvalidRange
+        Regex::new_posix_ci("[Z-a]").unwrap_err().kind(),
+        ErrorKind::InvalidRange
     );
 }
 

@@ -45,7 +45,7 @@ mod error;
 mod parser;
 mod vm;
 
-pub use error::Error;
+pub use error::{Error, ErrorKind};
 
 /// A compiled regular expression program.
 #[derive(Clone)]
@@ -104,7 +104,7 @@ impl Regex {
     /// - Range endpoints fold too: `[a-f]` also matches `A`–`F`, `[X-Z]`
     ///   also matches `x`–`z` — but `a` still does *not* match `[X-Z]`.
     ///   A range that is reversed after folding (e.g. `[Z-a]`) is an
-    ///   [`Error::InvalidRange`], as glibc rejects it.
+    ///   [`ErrorKind::InvalidRange`], as glibc rejects it.
     /// - `[[:upper:]]` and `[[:lower:]]` both behave as `[[:alpha:]]` —
     ///   glibc's `REG_ICASE` rule, so `[[ ABC =~ [[:lower:]]bc ]]` matches
     ///   under `nocasematch` in real bash.
