@@ -16,8 +16,8 @@ it in drops five crates from rush's dependency tree.
 including the POSIX leftmost-longest mode (`Regex::new_posix`) and the
 case-insensitive mode (`Regex::new_posix_ci`), and validated by a
 differential harness against the `regex` crate and a live bash oracle.
-The remaining [roadmap](DESIGN.md#roadmap) item is the rush integration
-itself (step 4).
+Every [roadmap](DESIGN.md#roadmap) step is complete, including the rush
+integration: rush's `[[ =~ ]]` conditional runs on this engine.
 
 ## Scope
 
