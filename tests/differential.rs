@@ -615,6 +615,76 @@ fn differential_posix_ci_captures_against_bash_oracle() {
     }
 }
 
+/// The REG_NEWLINE mode vs the regex crate's `(?m)`: over patterns
+/// without negated classes (the crate's `[^a]` matches `\n`; ours
+/// excludes it in this mode — and that includes `\W`/`\S`, which are
+/// negated classes in disguise), the semantics coincide — the crate's
+/// `.` already excludes `\n` — so `(?m)` is a full oracle. Texts include
+/// newlines. Patterns with anchors compare booleans only: slicing text
+/// for the prefilter-artifact confirmation changes line context under
+/// `(?m)`, so full-capture comparison there could mask real divergences.
+#[test]
+fn differential_newline_against_regex_crate() {
+    const CLASSES_NL: &[&str] = &[
+        "[abc]",
+        "[a-f]",
+        "[0-9]",
+        "[a-c0-3]",
+        "[[:digit:]]",
+        "[[:alpha:]]",
+        "[]a]",
+        "[a-]",
+    ];
+    let mut rng = Rng(0x0E11_11E0_0000_0006);
+    for case in 0..CASES {
+        let pattern = gen_pattern_over(&mut rng, true, LETTERS, CLASSES_NL, ASSERTS_CRATE);
+        let ours = Regex::builder()
+            .newline(true)
+            .build(&pattern)
+            .unwrap_or_else(|e| panic!("case {case}: we rejected {pattern:?}: {e}"));
+        // Negated-class escapes exclude \n under REG_NEWLINE (glibc);
+        // the crate's (?m) versions don't — outside the shared subset.
+        if pattern.contains("\\W") || pattern.contains("\\S") {
+            continue;
+        }
+        let wrapped = format!("(?m:{pattern})");
+        let Ok(theirs) = regex::Regex::new(&wrapped) else {
+            continue;
+        };
+        let anchored = pattern.contains('^') || pattern.contains('$');
+        for _ in 0..TEXTS_PER_PATTERN {
+            let text: String = gen_text_over(&mut rng, b"aabbcc0123 \n\n.-");
+            assert_eq!(
+                ours.is_match(&text),
+                theirs.is_match(&text),
+                "case {case}: newline is_match divergence on {pattern:?}, text {text:?}"
+            );
+            if anchored {
+                continue;
+            }
+            let a: Option<Vec<Option<String>>> = ours.captures(&text).map(|caps| {
+                (0..caps.len())
+                    .map(|i| caps.get(i).map(str::to_owned))
+                    .collect()
+            });
+            let b: Option<Vec<Option<String>>> = theirs.captures(&text).map(|caps| {
+                (0..caps.len())
+                    .map(|i| caps.get(i).map(|m| m.as_str().to_owned()))
+                    .collect()
+            });
+            if a != b
+                && crate_skipped_earlier_match_wrapped(&pattern, &wrapped, &ours, &theirs, &text)
+            {
+                continue;
+            }
+            assert_eq!(
+                a, b,
+                "case {case}: newline divergence on {pattern:?}, text {text:?} (ours = left)"
+            );
+        }
+    }
+}
+
 /// glibc (what bash uses) does not implement the POSIX rule that an
 /// alternation prefers its longest-matching branch *inside a repetition
 /// iteration*: it can report a shorter branch for the final iteration when
