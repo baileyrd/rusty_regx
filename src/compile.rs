@@ -64,14 +64,28 @@ pub struct Program {
     /// pattern literals and range endpoints via [`fold`]; the VM must fold
     /// each input character the same way before comparing.
     pub icase: bool,
-    /// The literal character every match must start with, if there is one
-    /// (and the program has an unanchored prefix to accelerate). The VM
-    /// may fast-forward the scan to its next occurrence whenever no live
-    /// thread carries progress. `None` for anchored programs, `icase`
-    /// mode (the input folds before comparing, so a plain substring
-    /// search would miss case variants), and patterns without a single
-    /// mandatory first literal.
-    pub prefix_char: Option<char>,
+    /// The literal string every match must start with (empty if none, or
+    /// if the program can't use it). The VM may fast-forward the scan to
+    /// its next occurrence whenever no live thread carries progress.
+    /// Empty for anchored programs, `icase` mode (the input folds before
+    /// comparing, so a plain substring search would miss case variants),
+    /// and patterns without a mandatory literal head.
+    pub prefix: String,
+    /// Set when the whole pattern is a plain literal (optionally anchored
+    /// at either end): the VM bypasses NFA simulation entirely and
+    /// matches by substring search. Never set in `icase` mode.
+    pub literal: Option<Literal>,
+}
+
+/// A pattern that is a plain literal, matched by substring search.
+#[derive(Debug, Clone)]
+pub struct Literal {
+    /// The literal text.
+    pub s: String,
+    /// Whether the pattern began with `^`.
+    pub anchored_start: bool,
+    /// Whether the pattern ended with `$`.
+    pub anchored_end: bool,
 }
 
 /// The `REG_ICASE` case fold: simple (single-character) uppercase mapping.
@@ -99,9 +113,8 @@ pub fn fold(c: char) -> char {
 /// `=~` semantics. Anchored programs omit the prefix entirely: their
 /// thread list empties as soon as position 0 fails, so `^b` against a
 /// megabyte of text stops after one character instead of scanning it all.
-pub fn compile(ast: &Ast, icase: bool) -> Result<Program, Error> {
-    let group_count = max_group(ast) as usize + 1;
-    let mut ast = ast.clone();
+pub fn compile(mut ast: Ast, icase: bool) -> Result<Program, Error> {
+    let group_count = max_group(&ast) as usize + 1;
     let mut tag_order = vec![0];
     let mut next_slot = 2 * group_count;
     number(&mut ast, &mut next_slot, &mut tag_order);
@@ -126,11 +139,11 @@ pub fn compile(ast: &Ast, icase: bool) -> Result<Program, Error> {
     c.emit(&ast)?;
     c.push(Inst::Save(1))?;
     c.push(Inst::Match)?;
-    let prefix_char = if anchored || icase {
-        None
-    } else {
-        first_char(&ast)
-    };
+    let mut prefix = String::new();
+    if !anchored && !icase {
+        collect_prefix(&ast, &mut prefix);
+    }
+    let literal = if icase { None } else { literal_of(&ast) };
     Ok(Program {
         insts: c.insts,
         classes: c.classes,
@@ -138,8 +151,42 @@ pub fn compile(ast: &Ast, icase: bool) -> Result<Program, Error> {
         slot_count: next_slot,
         tag_order,
         icase,
-        prefix_char,
+        prefix,
+        literal,
     })
+}
+
+/// If the whole pattern is a plain literal — `Char`s only, optionally
+/// `^`-anchored at the head and `$`-anchored at the tail — returns it for
+/// the VM's substring fast path. Such a pattern has no groups, so group 0
+/// is the only capture. This is the common shape rush produces via
+/// `escape()` for `[[ $x =~ $literal ]]`.
+fn literal_of(ast: &Ast) -> Option<Literal> {
+    let single = std::slice::from_ref(ast);
+    let mut items: &[Ast] = match ast {
+        Ast::Concat(items) => items,
+        _ => single,
+    };
+    let mut lit = Literal {
+        s: String::new(),
+        anchored_start: false,
+        anchored_end: false,
+    };
+    if let Some(Ast::StartAnchor) = items.first() {
+        lit.anchored_start = true;
+        items = &items[1..];
+    }
+    if let Some(Ast::EndAnchor) = items.last() {
+        lit.anchored_end = true;
+        items = &items[..items.len() - 1];
+    }
+    for item in items {
+        match item {
+            Ast::Char(c) => lit.s.push(*c),
+            _ => return None,
+        }
+    }
+    Some(lit)
 }
 
 /// Whether every match of `ast` must start at position 0 — i.e. every
@@ -156,24 +203,53 @@ fn starts_anchored(ast: &Ast) -> bool {
     }
 }
 
-/// The single literal character every match must start with, if any.
-/// Conservative: `None` unless every path through the pattern's head
-/// consumes exactly this character first (so a `min == 0` repetition or
-/// class head disqualifies).
-fn first_char(ast: &Ast) -> Option<char> {
+/// Accumulates the mandatory literal prefix of `ast` into `out` —
+/// the string every match must start with. Returns whether the walked
+/// construct is *exactly* its literal (so the prefix may keep growing
+/// past it). Conservative: anything uncertain ends the prefix.
+fn collect_prefix(ast: &Ast, out: &mut String) -> bool {
     match ast {
-        Ast::Char(c) => Some(*c),
-        Ast::Concat(items) => first_char(items.first()?),
-        Ast::Alternation(branches) => {
-            let c = first_char(branches.first()?)?;
-            branches
-                .iter()
-                .all(|b| first_char(b) == Some(c))
-                .then_some(c)
+        Ast::Char(c) => {
+            out.push(*c);
+            true
         }
-        Ast::Group(_, inner) => first_char(inner),
-        Ast::Repeat { ast, min, .. } if *min >= 1 => first_char(ast),
-        _ => None,
+        Ast::Concat(items) => items.iter().all(|item| collect_prefix(item, out)),
+        Ast::Group(_, inner) => collect_prefix(inner, out),
+        Ast::Repeat { ast, min, max, .. } if *min >= 1 => {
+            // A fully-literal body repeats contiguously `min` times; the
+            // prefix continues past it only for an exact count.
+            let start = out.len();
+            if !collect_prefix(ast, out) {
+                return false;
+            }
+            let body = out[start..].to_string();
+            for _ in 1..*min {
+                out.push_str(&body);
+            }
+            *max == Some(*min)
+        }
+        Ast::Alternation(branches) => {
+            // The longest common prefix of the branches is mandatory;
+            // nothing past the alternation can extend it.
+            let mut prefixes = branches.iter().map(|b| {
+                let mut p = String::new();
+                collect_prefix(b, &mut p);
+                p
+            });
+            let mut common = prefixes.next().unwrap_or_default();
+            for p in prefixes {
+                let shared = common
+                    .chars()
+                    .zip(p.chars())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| a.len_utf8())
+                    .sum();
+                common.truncate(shared);
+            }
+            out.push_str(&common);
+            false
+        }
+        _ => false,
     }
 }
 

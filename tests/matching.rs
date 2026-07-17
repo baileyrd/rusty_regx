@@ -352,6 +352,119 @@ fn scan_optimizations_preserve_semantics() {
 }
 
 #[test]
+fn find_agrees_with_captures_span_in_every_mode() {
+    let cases = [
+        ("a|ab", "xab"),
+        ("(a+)(b+)", "zzaabbz"),
+        ("^([[:alpha:]]+)-([0-9]+)$", "release-2026"),
+        ("(x)?(b)", "abc"),
+        ("q", "zz"),
+        ("bcd", "abcdbcd"),
+    ];
+    for (pattern, text) in cases {
+        for re in [
+            Regex::new(pattern).unwrap(),
+            Regex::new_posix(pattern).unwrap(),
+        ] {
+            let found = re.find(text).map(|m| (m.start(), m.end()));
+            let span0 = re.captures(text).and_then(|c| c.span(0));
+            assert_eq!(found, span0, "find/captures disagree: {pattern} on {text}");
+        }
+    }
+    // POSIX find is leftmost-longest, like captures.
+    let m = Regex::new_posix("a|ab").unwrap().find("xab").unwrap();
+    assert_eq!((m.start(), m.end(), m.as_str()), (1, 3, "ab"));
+    assert_eq!(m.range(), 1..3);
+    // Leftmost-first find takes the first alternative.
+    assert_eq!(
+        Regex::new("a|ab").unwrap().find("xab").unwrap().as_str(),
+        "a"
+    );
+}
+
+#[test]
+fn group_count_and_from_str() {
+    assert_eq!(Regex::new("abc").unwrap().group_count(), 1);
+    assert_eq!(Regex::new("(a)((b))").unwrap().group_count(), 4);
+    let re: Regex = "a|b".parse().unwrap();
+    assert!(re.is_match("zb"));
+    assert!("a{".parse::<Regex>().is_err());
+}
+
+/// Pure-literal patterns take a substring-search path that bypasses the
+/// VM; these pin its semantics against the general engine's.
+#[test]
+fn literal_fast_path_matches_vm_semantics() {
+    // Leftmost occurrence, correct spans, all four anchor combinations.
+    assert_eq!(find("bcd", "abcdbcd"), Some("bcd"));
+    assert_eq!(find("^ab", "abab"), Some("ab"));
+    assert_eq!(find("ab$", "abab"), Some("ab"));
+    assert_eq!(find("^ab$", "ab"), Some("ab"));
+    assert_eq!(find("^ab$", "abab"), None);
+    assert_eq!(find("^", "xy"), Some(""));
+    assert_eq!(find("$", "xy"), Some(""));
+    assert_eq!(find("^$", ""), Some(""));
+    assert_eq!(find("^$", "x"), None);
+    // Escaped metacharacters are literal chars: still the literal path.
+    assert_eq!(find(r"a\.b", "xa.by"), Some("a.b"));
+    assert_eq!(find(r"a\.b", "xaXby"), None);
+    // Multibyte literals, correct byte spans.
+    let caps = Regex::new("éx").unwrap().captures("zéxy").unwrap();
+    assert_eq!(caps.span(0), Some((1, 4)));
+    // POSIX mode and is_match agree with the leftmost-first path.
+    for (p, t) in [
+        ("bcd", "abcdbcd"),
+        ("^ab$", "abab"),
+        ("ab$", "abab"),
+        ("q", "zz"),
+    ] {
+        let first = Regex::new(p).unwrap();
+        let posix = Regex::new_posix(p).unwrap();
+        assert_eq!(
+            first.captures(t).map(|c| c.span(0)),
+            posix.captures(t).map(|c| c.span(0)),
+            "{p} on {t}"
+        );
+        assert_eq!(first.is_match(t), first.captures(t).is_some(), "{p} on {t}");
+    }
+    // icase literals do NOT take the fast path (folding): still correct.
+    assert_eq!(
+        Regex::new_ci("abc")
+            .unwrap()
+            .captures("xABCy")
+            .unwrap()
+            .get(0),
+        Some("ABC")
+    );
+}
+
+/// Multi-char mandatory prefixes accelerate the scan; these pin the
+/// cases where prefix extraction could overreach.
+#[test]
+fn prefix_acceleration_preserves_semantics() {
+    let long = "xy ".repeat(500);
+    // Prefix crosses group boundaries and alternation LCPs.
+    assert_eq!(
+        groups("(ab)(c|d)e?", &format!("{long}abde")),
+        Some(vec![
+            Some("abde".into()),
+            Some("ab".into()),
+            Some("d".into())
+        ])
+    );
+    // Exact-count repetitions extend the prefix ("aaa" here)...
+    assert_eq!(find("a{3}b?", &format!("{long}aaa")), Some("aaa"));
+    // ...but open-ended ones stop it after the mandatory copies.
+    assert_eq!(find("a{2,}b", &format!("{long}aaaab")), Some("aaaab"));
+    // A non-literal repetition body contributes only its own prefix
+    // ("a", not "aa"): this text contains no "aa", so an overreaching
+    // prefix would fast-forward past the only match.
+    assert_eq!(find("(ab?){2}c", &format!("{long}abac")), Some("abac"));
+    assert_eq!(find("(ab?){2}c", &format!("{long}ababc")), Some("ababc"));
+    assert_eq!(find("(ab?){2}c", &format!("{long}aac")), Some("aac"));
+}
+
+#[test]
 fn repetition_size_limits() {
     assert_eq!(
         Regex::new("a{1001}").unwrap_err().kind(),

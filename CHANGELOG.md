@@ -4,6 +4,30 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `Regex::find` returning a `Match` (start/end/range/as_str): tracks
+  only the overall match's offsets, at near-boolean cost in every mode.
+- `Regex::group_count()`; `FromStr` for `Regex`.
+- Differential coverage for the case-insensitive modes: `new_ci` is
+  verified against the `regex` crate's `(?i)` over ASCII (its first
+  oracle).
+- Tag-triggered crates.io publish workflow (needs the
+  `CARGO_REGISTRY_TOKEN` repository secret).
+
+### Performance
+
+- Pure-literal patterns (what `escape()` produces) bypass the VM via
+  substring search, in all modes.
+- The scan fast-forward prefix grows from one mandatory char to the
+  longest mandatory literal string (663µs → 74µs on the literal-prefix
+  benchmark).
+- Generation-stamped visited/best sets drop the O(program) clear per
+  input char; `compile()` no longer deep-clones the AST; the
+  triplicated VM step dispatch is unified.
+
 ## [0.2.0] — 2026-07-17
 
 Hardening, API, and performance pass on the 0.1.0 engine; now the

@@ -238,6 +238,20 @@ fn crate_skipped_earlier_match(
     theirs: &regex::Regex,
     text: &str,
 ) -> bool {
+    crate_skipped_earlier_match_wrapped(pattern, pattern, ours, theirs, text)
+}
+
+/// As [`crate_skipped_earlier_match`], for engines compiled from a
+/// transformed pattern (e.g. `(?i:...)`): `raw` is the generated pattern
+/// (for the anchor check), `crate_pat` what the crate compiled.
+fn crate_skipped_earlier_match_wrapped(
+    raw: &str,
+    crate_pat: &str,
+    ours: &Regex,
+    theirs: &regex::Regex,
+    text: &str,
+) -> bool {
+    let pattern = raw;
     let (our_g0, their_m) = match (
         ours.captures(text).and_then(|c| c.get(0)),
         theirs.find(text),
@@ -256,7 +270,7 @@ fn crate_skipped_earlier_match(
     if pattern.starts_with('^') || pattern.ends_with('$') {
         return false;
     }
-    regex::Regex::new(&format!("^(?:{pattern})"))
+    regex::Regex::new(&format!("^(?:{crate_pat})"))
         .ok()
         .and_then(|re| re.find(&text[our_start..]))
         .is_some_and(|m| m.as_str() == our_g0)
@@ -322,6 +336,50 @@ fn differential_against_bash_oracle() {
             ours, bash,
             "bash divergence on pattern {pattern:?}, text {text:?} (ours = left)"
         );
+    }
+}
+
+/// The leftmost-first case-insensitive mode (`new_ci`) has no bash
+/// oracle — bash's `nocasematch` is leftmost-longest — so the `regex`
+/// crate's `(?i)` is the oracle: over ASCII input, `REG_ICASE`
+/// upper-folding and the crate's case-insensitive matching agree
+/// (including folded ranges and `[[:upper:]]`/`[[:lower:]]`, which both
+/// engines make case-symmetric).
+#[test]
+fn differential_ci_against_regex_crate() {
+    let mut rng = Rng(0xC1CA_5ED1_FF00_0005);
+    for case in 0..CASES {
+        let pattern = gen_pattern_over(&mut rng, true, LETTERS_CI, CLASSES_CI);
+        let ours = Regex::new_ci(&pattern)
+            .unwrap_or_else(|e| panic!("case {case}: we rejected {pattern:?}: {e}"));
+        let wrapped = format!("(?i:{pattern})");
+        // Grammar corner cases the crate rejects (e.g. `[]a]`) aren't
+        // comparable; skip them rather than lose the whole run.
+        let Ok(theirs) = regex::Regex::new(&wrapped) else {
+            continue;
+        };
+        for _ in 0..TEXTS_PER_PATTERN {
+            let text = gen_text_over(&mut rng, b"aAbBcC0123dDeEf .-");
+            let a: Option<Vec<Option<String>>> = ours.captures(&text).map(|caps| {
+                (0..caps.len())
+                    .map(|i| caps.get(i).map(str::to_owned))
+                    .collect()
+            });
+            let b: Option<Vec<Option<String>>> = theirs.captures(&text).map(|caps| {
+                (0..caps.len())
+                    .map(|i| caps.get(i).map(|m| m.as_str().to_owned()))
+                    .collect()
+            });
+            if a != b
+                && crate_skipped_earlier_match_wrapped(&pattern, &wrapped, &ours, &theirs, &text)
+            {
+                continue;
+            }
+            assert_eq!(
+                a, b,
+                "case {case}: ci divergence on pattern {pattern:?}, text {text:?} (ours = left)"
+            );
+        }
     }
 }
 

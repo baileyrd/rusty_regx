@@ -34,6 +34,11 @@ jobs:
       # readme path) without the slow verify build.
       - name: Package check
         run: cargo package --no-verify
+      # Informational: prints the comparison table against the regex
+      # crate into the run log, so perf regressions are visible in
+      # review without asserting on noisy shared-runner timings.
+      - name: Benchmarks
+        run: cargo bench
 
   # The declared MSRV (Cargo.toml rust-version) is a promise; the code even
   # carries manual workarounds for it (map_or over is_none_or in vm.rs).
@@ -65,6 +70,14 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # The fuzz crate is the only Rust the root fmt/clippy steps don't
+      # see; lint it here (the components ship with the default nightly
+      # profile — the add is a no-op safety net).
+      - name: Lint fuzz crate
+        run: |
+          rustup component add rustfmt clippy
+          cargo fmt --check --manifest-path fuzz/Cargo.toml
+          cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
       # A short smoke run per target on every change; real coverage comes
       # from longer local runs (`cargo +nightly fuzz run <target>`,
       # unseeded so each run explores fresh input space).

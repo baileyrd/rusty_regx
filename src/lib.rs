@@ -127,7 +127,7 @@ impl Regex {
 
     fn compile(pattern: &str, posix: bool, icase: bool) -> Result<Regex, Error> {
         let ast = parser::parse(pattern)?;
-        let program = compile::compile(&ast, icase)?;
+        let program = compile::compile(ast, icase)?;
         Ok(Regex {
             pattern: pattern.into(),
             program,
@@ -156,11 +156,77 @@ impl Regex {
     /// the match report as absent via [`Captures::get`].
     pub fn captures<'t>(&self, text: &'t str) -> Option<Captures<'t>> {
         let slots = if self.posix {
-            vm::exec_posix(&self.program, text)
+            vm::exec_posix(&self.program, text, self.program.slot_count)
         } else {
-            vm::exec(&self.program, text)
+            vm::exec(&self.program, text, self.program.slot_count)
         };
         slots.map(|slots| Captures { text, slots })
+    }
+
+    /// Searches `text` for the leftmost match, returning only its
+    /// location.
+    ///
+    /// Cheaper than [`Regex::captures`] when the groups aren't needed:
+    /// the VM tracks only the overall match's two offsets, however many
+    /// groups the pattern has. The span is the same one `captures` would
+    /// report as group 0 (in every mode — POSIX leftmost-longest
+    /// disambiguates group 0 by its own span first).
+    pub fn find<'t>(&self, text: &'t str) -> Option<Match<'t>> {
+        let slots = if self.posix {
+            vm::exec_posix(&self.program, text, 2)
+        } else {
+            vm::exec(&self.program, text, 2)
+        };
+        slots
+            .and_then(|slots| slots.first().copied().flatten())
+            .map(|(start, end)| Match { text, start, end })
+    }
+
+    /// The number of capture groups this pattern has, including group 0
+    /// (the whole match) — the `len()` of any successful
+    /// [`Regex::captures`] result.
+    pub fn group_count(&self) -> usize {
+        self.program.group_count
+    }
+}
+
+/// `"pattern".parse::<Regex>()` — equivalent to [`Regex::new`].
+impl std::str::FromStr for Regex {
+    type Err = Error;
+
+    fn from_str(pattern: &str) -> Result<Regex, Error> {
+        Regex::new(pattern)
+    }
+}
+
+/// The location of a single match in the searched text (see
+/// [`Regex::find`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Match<'t> {
+    text: &'t str,
+    start: usize,
+    end: usize,
+}
+
+impl<'t> Match<'t> {
+    /// The match's starting byte offset (on a `char` boundary).
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    /// The match's ending byte offset (exclusive, on a `char` boundary).
+    pub fn end(&self) -> usize {
+        self.end
+    }
+
+    /// The match's byte range, `start()..end()`.
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.start..self.end
+    }
+
+    /// The matched text.
+    pub fn as_str(&self) -> &'t str {
+        &self.text[self.start..self.end]
     }
 }
 
