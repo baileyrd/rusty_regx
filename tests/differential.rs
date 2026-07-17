@@ -75,6 +75,10 @@ const CLASSES_CI: &[&str] = &[
     "[A-]",
 ];
 
+/// Extra classes only the bash oracles get: the regex crate rejects
+/// collating syntax outright.
+const CLASSES_BASH_EXTRA: &[&str] = &["[[.a.]]", "[[.a.]-c]", "[[=b=]]"];
+
 const LETTERS: &[u8] = b"abc01 ";
 const LETTERS_CI: &[u8] = b"abcABC01 ";
 
@@ -166,9 +170,31 @@ fn gen_alternation(rng: &mut Rng, depth: u32, g: Gen) -> String {
 }
 
 /// A full pattern: an alternation, optionally anchored at either end.
-fn gen_pattern(rng: &mut Rng, nested_quant: bool, asserts: &'static [&'static str]) -> String {
-    gen_pattern_over(rng, nested_quant, LETTERS, CLASSES, asserts)
+fn gen_pattern(
+    rng: &mut Rng,
+    nested_quant: bool,
+    asserts: &'static [&'static str],
+    classes: &'static [&'static str],
+) -> String {
+    gen_pattern_over(rng, nested_quant, LETTERS, classes, asserts)
 }
+
+/// `CLASSES` plus the bash-only collating forms, for the bash oracles.
+const CLASSES_GNU: &[&str] = &[
+    "[abc]",
+    "[^ab]",
+    "[a-f]",
+    "[0-9]",
+    "[a-c0-3]",
+    "[[:digit:]]",
+    "[[:alpha:]]",
+    "[[:alnum:]]",
+    "[]a]",
+    "[a-]",
+    "[[.a.]]",
+    "[[.a.]-c]",
+    "[[=b=]]",
+];
 
 fn gen_pattern_over(
     rng: &mut Rng,
@@ -214,7 +240,7 @@ const TEXTS_PER_PATTERN: u32 = 4;
 fn differential_against_regex_crate() {
     let mut rng = Rng(0x5EED_CAFE_F00D_0001);
     for case in 0..CASES {
-        let pattern = gen_pattern(&mut rng, true, ASSERTS_CRATE);
+        let pattern = gen_pattern(&mut rng, true, ASSERTS_CRATE, CLASSES);
         let ours = Regex::new(&pattern)
             .unwrap_or_else(|e| panic!("case {case}: we rejected {pattern:?}: {e}"));
         let theirs = regex::Regex::new(&pattern)
@@ -336,7 +362,7 @@ fn differential_against_bash_oracle() {
     let mut cases = Vec::new();
     let mut input = String::new();
     for _ in 0..CASES {
-        let pattern = gen_pattern(&mut rng, false, ASSERTS_GNU);
+        let pattern = gen_pattern(&mut rng, false, ASSERTS_GNU, CLASSES_GNU);
         let text = gen_text(&mut rng);
         input.push_str(&pattern);
         input.push('\n');
@@ -462,7 +488,7 @@ fn differential_posix_captures_against_bash_oracle() {
     let mut cases = Vec::new();
     let mut input = String::new();
     for _ in 0..CASES {
-        let pattern = gen_pattern(&mut rng, false, ASSERTS_GNU);
+        let pattern = gen_pattern(&mut rng, false, ASSERTS_GNU, CLASSES_GNU);
         let text = gen_text(&mut rng);
         input.push_str(&pattern);
         input.push('\n');

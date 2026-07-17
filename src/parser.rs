@@ -3,7 +3,7 @@
 //! Covers the full ERE grammar, including the bracket-expression corner
 //! cases: `[]a]` (literal `]` first), `[a-]` (trailing `-`), `[^]]`, and
 //! POSIX classes `[[:alpha:]]`…`[[:xdigit:]]`. Malformed intervals are
-//! errors (`{,}`, `{a}`, `{3,2}`), per DESIGN.md.
+//! errors (`{a}`, `{3,2}`), per DESIGN.md.
 //!
 //! GNU extensions (bash's `regcomp` is glibc, and real scripts rely on
 //! these; each verified against bash 5.2):
@@ -15,15 +15,6 @@
 //!   Quantifying one directly is an error, as in glibc.
 //! - `` \` `` and `\'` = start/end of input.
 //! - `{,n}` = `{0,n}`, and `{,}` = `*`.
-//!
-//! GNU extensions (bash's `regcomp` is glibc, and real scripts rely on
-//! these; each verified against bash 5.2): `\w` `\W` (word chars,
-//! `[[:alnum:]_]`), `\s` `\S` (`[[:space:]]`), `\b` `\B` word
-//! boundary/non-boundary, `\<` `\>` word start/end (quantifying an
-//! assertion directly is an error, as in glibc), `` \` `` `\'` input
-//! start/end, and `{,n}` = `{0,n}` (so `{,}` = `*`). Outside this set,
-//! `\c` stays a literal `c` (`\d` is a literal `d`, as in glibc); inside
-//! brackets the POSIX literal-backslash rule still applies.
 //!
 //! Deliberate choices where POSIX leaves behavior undefined:
 //!
@@ -37,7 +28,10 @@
 //! - `{` always begins an interval and must be well-formed; a lone `}` is a
 //!   literal.
 //! - Collating symbols `[.x.]` and equivalence classes `[=x=]` are
-//!   unsupported and rejected.
+//!   accepted in their degenerate single-char forms (the whole symbol in
+//!   the C/UTF-8 locales bash runs in); a collating symbol may be a range
+//!   endpoint, an equivalence class may not, and multi-char collating
+//!   names are errors — all as glibc behaves (bash-verified).
 //! - Groups may nest at most [`MAX_NESTING_DEPTH`] deep; beyond that the
 //!   pattern is rejected rather than risking a stack overflow.
 
@@ -323,29 +317,46 @@ impl Parser<'_> {
     /// One bracket item: a POSIX class, a range `a-z`, or a literal char.
     fn bracket_item(&mut self, class: &mut Class) -> Result<(), Error> {
         let start = self.char_pos;
-        if self.peek() == Some('[') {
+        let mut lo_is_equiv = false;
+        let lo = if self.peek() == Some('[') {
             match self.peek_at(1) {
                 Some(':') => {
                     class.posix.push(self.posix_class()?);
                     return Ok(());
                 }
-                // Collating symbols and equivalence classes are out of scope.
-                Some('.') | Some('=') => {
-                    return Err(Error::new(ErrorKind::InvalidPosixClass, Some(start)))
+                // The degenerate (single-char) forms of collating symbols
+                // and equivalence classes — what bash accepts in C/UTF-8
+                // locales; multi-char collating names stay errors.
+                Some('.') => self.collating(start, '.')?,
+                Some('=') => {
+                    lo_is_equiv = true;
+                    self.collating(start, '=')?
                 }
-                _ => {}
+                _ => self.bump().expect("checked non-empty"),
             }
-        }
-        let lo = self.bump().expect("checked non-empty");
+        } else {
+            self.bump().expect("checked non-empty")
+        };
         // `a-z` is a range unless the `-` is last (`[a-]`, trailing `-` is
         // literal) or the expression is unclosed.
         if self.peek() == Some('-') && self.peek_at(1).is_some_and(|c| c != ']') {
-            self.bump();
-            let hi = self.bump().expect("checked non-empty");
-            // A class can't be a range endpoint: `[a-[:digit:]]`.
-            if hi == '[' && matches!(self.peek(), Some(':') | Some('.') | Some('=')) {
+            // glibc: an equivalence class can't be a range endpoint
+            // (`[[=a=]-c]` is a compile error), but a collating symbol can.
+            if lo_is_equiv {
                 return Err(Error::new(ErrorKind::InvalidRange, Some(start)));
             }
+            self.bump();
+            let hi = if self.peek() == Some('[') && self.peek_at(1) == Some('.') {
+                self.collating(start, '.')?
+            } else {
+                let hi = self.bump().expect("checked non-empty");
+                // A class or equivalence can't be a range endpoint:
+                // `[a-[:digit:]]`, `[a-[=c=]]`.
+                if hi == '[' && matches!(self.peek(), Some(':') | Some('=')) {
+                    return Err(Error::new(ErrorKind::InvalidRange, Some(start)));
+                }
+                hi
+            };
             if lo > hi {
                 return Err(Error::new(ErrorKind::InvalidRange, Some(start)));
             }
@@ -354,6 +365,22 @@ impl Parser<'_> {
             class.ranges.push((lo, lo));
         }
         Ok(())
+    }
+
+    /// Parses the degenerate form of `[.c.]` (`delim == '.'`) or `[=c=]`
+    /// (`delim == '='`): exactly one char between the delimiters. In the
+    /// C/UTF-8 locales bash runs in, that char is the whole collating
+    /// symbol / equivalence class; multi-char collating names are errors
+    /// in glibc too ("no such collating element").
+    fn collating(&mut self, at: usize, delim: char) -> Result<char, Error> {
+        let err = || Error::new(ErrorKind::InvalidPosixClass, Some(at));
+        self.bump(); // `[`
+        self.bump(); // delim
+        let c = self.bump().ok_or_else(err)?;
+        if !(self.eat(delim) && self.eat(']')) {
+            return Err(err());
+        }
+        Ok(c)
     }
 
     /// Parses `[:name:]`; the leading `[` has been peeked (not consumed).
@@ -629,9 +656,22 @@ mod tests {
         assert_eq!(err("[[:foo:]]"), ErrorKind::InvalidPosixClass);
         assert_eq!(err("[[:alpha]]"), ErrorKind::InvalidPosixClass);
         assert_eq!(err("[[:alpha"), ErrorKind::InvalidPosixClass);
-        // Collating symbols and equivalence classes are unsupported.
-        assert_eq!(err("[[.a.]]"), ErrorKind::InvalidPosixClass);
-        assert_eq!(err("[[=a=]]"), ErrorKind::InvalidPosixClass);
+        // Degenerate (single-char) collating symbols and equivalence
+        // classes are literals, as bash accepts them; collating symbols
+        // work as range endpoints, equivalence classes don't, and
+        // multi-char collating names are errors (all bash-verified).
+        assert_eq!(parse("[[.a.]]"), Ok(class(false, &[('a', 'a')], &[])));
+        assert_eq!(parse("[[=a=]]"), Ok(class(false, &[('a', 'a')], &[])));
+        assert_eq!(parse("[[.a.]-c]"), Ok(class(false, &[('a', 'c')], &[])));
+        assert_eq!(parse("[a-[.c.]]"), Ok(class(false, &[('a', 'c')], &[])));
+        assert_eq!(
+            parse("[[.-.]c]"),
+            Ok(class(false, &[('-', '-'), ('c', 'c')], &[]))
+        );
+        assert_eq!(err("[[=a=]-c]"), ErrorKind::InvalidRange);
+        assert_eq!(err("[a-[=c=]]"), ErrorKind::InvalidRange);
+        assert_eq!(err("[[.ab.]]"), ErrorKind::InvalidPosixClass);
+        assert_eq!(err("[[.a"), ErrorKind::InvalidPosixClass);
         // A `[` not followed by `:` `.` `=` is a literal inside brackets.
         assert_eq!(
             parse("[[a]"),
