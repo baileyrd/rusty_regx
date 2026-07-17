@@ -95,7 +95,15 @@ fn at_restart(clist: &[(usize, Slots)], restart: &[usize], pos: usize) -> bool {
 ///
 /// On a match, returns one `(start, end)` byte-offset pair per capture
 /// group (group 0 first); groups that did not participate are `None`.
-pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>> {
+/// `slot_limit` bounds capture tracking: `Save`s to slots at or past it
+/// are ignored and slot vectors are allocated that long. Pass
+/// `program.slot_count` for full captures, or 2 to track only group 0
+/// ([`crate::Regex::find`]) at near-boolean cost.
+pub fn exec(
+    program: &Program,
+    text: &str,
+    slot_limit: usize,
+) -> Option<Vec<Option<(usize, usize)>>> {
     if let Some(lit) = &program.literal {
         // A literal pattern has no groups: group 0 is the only capture.
         return literal_span(lit, text).map(|span| vec![Some(span)]);
@@ -111,7 +119,7 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
     let mut stack: Vec<(usize, Slots)> = Vec::new();
     let mut matched: Option<Slots> = None;
 
-    let initial = Rc::new(vec![None; program.slot_count]);
+    let initial = Rc::new(vec![None; slot_limit.min(program.slot_count)]);
     add_thread(
         program,
         &mut clist,
@@ -149,7 +157,7 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
                         gen,
                         &mut stack,
                         0,
-                        Rc::new(vec![None; program.slot_count]),
+                        Rc::new(vec![None; slot_limit.min(program.slot_count)]),
                         pos,
                         len,
                     );
@@ -196,7 +204,7 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
     }
 
     matched.map(|slots| {
-        (0..program.group_count)
+        (0..(slots.len() / 2).min(program.group_count))
             .map(|i| match (slots[2 * i], slots[2 * i + 1]) {
                 (Some(start), Some(end)) => Some((start, end)),
                 _ => None,
@@ -243,7 +251,9 @@ fn add_thread(
             }
             Inst::Save(slot) => {
                 let mut slots = slots;
-                Rc::make_mut(&mut slots)[*slot] = Some(pos);
+                if *slot < slots.len() {
+                    Rc::make_mut(&mut slots)[*slot] = Some(pos);
+                }
                 stack.push((pc + 1, slots));
             }
             Inst::StartAnchor => {
@@ -390,7 +400,15 @@ struct PosixStep {
 /// Same return contract as [`exec`]. Instead of cutting on `Match`, every
 /// candidate runs to completion and the best capture vector wins under
 /// [`posix_better`].
-pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>> {
+/// See [`exec`] for `slot_limit`. Group-0-only tracking stays correct
+/// here: truncated vectors compare on the group-0 pair alone, which is
+/// exactly overall leftmost-longest, and ties keep the incumbent — same
+/// group-0 span either way.
+pub fn exec_posix(
+    program: &Program,
+    text: &str,
+    slot_limit: usize,
+) -> Option<Vec<Option<(usize, usize)>>> {
     if let Some(lit) = &program.literal {
         // Fixed-length literal: leftmost-first and leftmost-longest agree.
         return literal_span(lit, text).map(|span| vec![Some(span)]);
@@ -406,7 +424,7 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
     let mut stack: Vec<(usize, Slots)> = Vec::new();
     let mut best_match: Option<Slots> = None;
 
-    let initial = Rc::new(vec![None; program.slot_count]);
+    let initial = Rc::new(vec![None; slot_limit.min(program.slot_count)]);
     closure_posix(program, &mut st, &mut stack, 0, initial, 0, len);
     harvest(&mut st, &mut clist);
     // See the fast-forward note in `exec`.
@@ -426,7 +444,7 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
                         &mut st,
                         &mut stack,
                         0,
-                        Rc::new(vec![None; program.slot_count]),
+                        Rc::new(vec![None; slot_limit.min(program.slot_count)]),
                         pos,
                         len,
                     );
@@ -467,7 +485,7 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
     }
 
     best_match.map(|slots| {
-        (0..program.group_count)
+        (0..(slots.len() / 2).min(program.group_count))
             .map(|i| match (slots[2 * i], slots[2 * i + 1]) {
                 (Some(start), Some(end)) => Some((start, end)),
                 _ => None,
@@ -528,7 +546,9 @@ fn closure_posix(
             }
             Inst::Save(slot) => {
                 let mut slots = slots;
-                Rc::make_mut(&mut slots)[*slot] = Some(pos);
+                if *slot < slots.len() {
+                    Rc::make_mut(&mut slots)[*slot] = Some(pos);
+                }
                 stack.push((pc + 1, slots));
             }
             Inst::StartAnchor => {
@@ -564,6 +584,10 @@ fn closure_posix(
 /// doesn't).
 fn posix_better(program: &Program, a: &Slots, b: &Slots) -> bool {
     for &base in &program.tag_order {
+        // Untracked under the current slot limit (group-0-only mode).
+        if base + 1 >= a.len() {
+            continue;
+        }
         match (a[base], b[base]) {
             (Some(x), Some(y)) if x != y => return x < y,
             _ => {}

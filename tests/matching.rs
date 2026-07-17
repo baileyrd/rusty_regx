@@ -351,6 +351,46 @@ fn scan_optimizations_preserve_semantics() {
     }
 }
 
+#[test]
+fn find_agrees_with_captures_span_in_every_mode() {
+    let cases = [
+        ("a|ab", "xab"),
+        ("(a+)(b+)", "zzaabbz"),
+        ("^([[:alpha:]]+)-([0-9]+)$", "release-2026"),
+        ("(x)?(b)", "abc"),
+        ("q", "zz"),
+        ("bcd", "abcdbcd"),
+    ];
+    for (pattern, text) in cases {
+        for re in [
+            Regex::new(pattern).unwrap(),
+            Regex::new_posix(pattern).unwrap(),
+        ] {
+            let found = re.find(text).map(|m| (m.start(), m.end()));
+            let span0 = re.captures(text).and_then(|c| c.span(0));
+            assert_eq!(found, span0, "find/captures disagree: {pattern} on {text}");
+        }
+    }
+    // POSIX find is leftmost-longest, like captures.
+    let m = Regex::new_posix("a|ab").unwrap().find("xab").unwrap();
+    assert_eq!((m.start(), m.end(), m.as_str()), (1, 3, "ab"));
+    assert_eq!(m.range(), 1..3);
+    // Leftmost-first find takes the first alternative.
+    assert_eq!(
+        Regex::new("a|ab").unwrap().find("xab").unwrap().as_str(),
+        "a"
+    );
+}
+
+#[test]
+fn group_count_and_from_str() {
+    assert_eq!(Regex::new("abc").unwrap().group_count(), 1);
+    assert_eq!(Regex::new("(a)((b))").unwrap().group_count(), 4);
+    let re: Regex = "a|b".parse().unwrap();
+    assert!(re.is_match("zb"));
+    assert!("a{".parse::<Regex>().is_err());
+}
+
 /// Pure-literal patterns take a substring-search path that bypasses the
 /// VM; these pin its semantics against the general engine's.
 #[test]

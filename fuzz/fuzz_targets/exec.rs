@@ -59,6 +59,12 @@ fn span0(re: &Regex, text: &str) -> Option<(usize, usize)> {
         caps.is_some(),
         "is_match disagrees with captures"
     );
+    let caps = caps;
+    assert_eq!(
+        re.find(text).map(|m| (m.start(), m.end())),
+        caps.as_ref().and_then(|c| c.span(0)),
+        "find disagrees with captures' group 0"
+    );
     let caps = caps?;
     let (start, end) = caps.span(0).expect("group 0 must participate");
     for i in 1..caps.len() {
