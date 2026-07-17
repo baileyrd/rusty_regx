@@ -74,7 +74,12 @@ Other decisions:
 3. **Captures** — `Save` slots on threads; unmatched optional groups report
    as absent (rush turns them into empty strings for `BASH_REMATCH`).
 4. **`escape()`** and rush integration behind a branch (swap ~10 lines in
-   `exec.rs` / `expand.rs`, drop 5 crates from the lock file).
+   `exec.rs` / `expand.rs`, drop 5 crates from the lock file). *(Done:
+   rush depends on this crate via git; `Regex::new_posix` /
+   `Regex::new_posix_ci` power `[[ =~ ]]` in `exec.rs`, `escape()` is
+   used in `expand.rs`, and the `regex` crate is out of rush's lock
+   file. Verified against rush's full test suite and a bash-parity
+   acceptance script.)*
 5. **Differential harness** — random patterns/inputs cross-checked against the
    `regex` crate (dev-dependency only) and a bash oracle script; port rush's
    C56 tests. Gate the swap on this.
