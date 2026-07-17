@@ -628,6 +628,68 @@ fn gnu_word_assertions_and_classes() {
     );
 }
 
+/// REG_NEWLINE mode via the builder (issue #21): line-oriented matching.
+#[test]
+fn newline_mode() {
+    let b = || Regex::builder().newline(true);
+    // `.` and negated classes exclude \n.
+    assert!(!b().build(".").unwrap().is_match("\n"));
+    assert!(b().build(".").unwrap().is_match("x"));
+    assert!(!b().build("[^a]").unwrap().is_match("\n"));
+    assert!(b().build("[^a]").unwrap().is_match("b"));
+    // Without the mode, both match \n (bash =~ behavior).
+    assert!(Regex::new(".").unwrap().is_match("\n"));
+    assert!(Regex::new("[^a]").unwrap().is_match("\n"));
+    // ^/$ match at line boundaries (and still at input edges).
+    let re = b().build("^b$").unwrap();
+    assert_eq!(re.captures("a\nb\nc").unwrap().span(0), Some((2, 3)));
+    assert!(b().build("^a").unwrap().is_match("a\nb"));
+    assert!(b().build("c$").unwrap().is_match("b\nc"));
+    assert!(!Regex::new("^b$").unwrap().is_match("a\nb\nc"));
+    // find_iter walks lines.
+    let re = b().build("^[a-z]+$").unwrap();
+    let words: Vec<&str> = re.find_iter("foo\nbar\nbaz").map(|m| m.as_str()).collect();
+    assert_eq!(words, ["foo", "bar", "baz"]);
+    // Composes with the other modes.
+    let re = Regex::builder()
+        .posix(true)
+        .case_insensitive(true)
+        .newline(true)
+        .build("^a|ab$")
+        .unwrap();
+    assert!(re.is_match("x\nAB"));
+    // Builder defaults equal Regex::new.
+    assert_eq!(
+        Regex::builder()
+            .build("a|ab")
+            .unwrap()
+            .find("xab")
+            .unwrap()
+            .as_str(),
+        "a"
+    );
+}
+
+/// debug_dump's format is unstable, but its load-bearing facts —
+/// which tier ran, what was extracted — should stay visible.
+#[test]
+fn debug_dump_shows_strategy() {
+    let dump = Regex::new("abc").unwrap().debug_dump();
+    assert!(dump.contains("literal substring path"), "{dump}");
+    let dump = Regex::new("release-[0-9]+").unwrap().debug_dump();
+    assert!(dump.contains("scan prefix: \"release-\""), "{dump}");
+    assert!(dump.contains("pike-vm"), "{dump}");
+    assert!(dump.contains("Match"), "{dump}");
+    let dump = Regex::builder()
+        .posix(true)
+        .newline(true)
+        .build("x[0-9]$")
+        .unwrap()
+        .debug_dump();
+    assert!(dump.contains("posix"), "{dump}");
+    assert!(dump.contains("+ newline"), "{dump}");
+}
+
 #[test]
 fn repetition_size_limits() {
     assert_eq!(

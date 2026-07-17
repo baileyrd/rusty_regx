@@ -20,7 +20,11 @@
 //!   identical to the `regex` crate. [`Regex::new_posix`] opts into POSIX
 //!   leftmost-longest semantics — what real bash/glibc report — and
 //!   [`Regex::new_posix_ci`] adds case-insensitive matching on top
-//!   (`REG_ICASE`, bash's `shopt -s nocasematch`).
+//!   (`REG_ICASE`, bash's `shopt -s nocasematch`). [`Regex::builder`]
+//!   composes the modes and adds `REG_NEWLINE` line matching.
+//! - GNU/glibc extensions are supported as bash accepts them: `\w` `\s`
+//!   `\b` `\<` and friends — see the parser docs and
+//!   `docs/FLAVORS.md`.
 //!
 //! # Example
 //!
@@ -125,9 +129,25 @@ impl Regex {
         Self::compile(pattern, false, true)
     }
 
+    /// Starts building a regex with non-default options — the general
+    /// form of the `new_*` constructors, plus options they don't cover
+    /// (currently [`RegexBuilder::newline`]).
+    pub fn builder() -> RegexBuilder {
+        RegexBuilder::default()
+    }
+
     fn compile(pattern: &str, posix: bool, icase: bool) -> Result<Regex, Error> {
+        Regex::compile_full(pattern, posix, icase, false)
+    }
+
+    fn compile_full(
+        pattern: &str,
+        posix: bool,
+        icase: bool,
+        newline: bool,
+    ) -> Result<Regex, Error> {
         let ast = parser::parse(pattern)?;
-        let program = compile::compile(ast, icase)?;
+        let program = compile::compile(ast, icase, newline)?;
         Ok(Regex {
             pattern: pattern.into(),
             program,
@@ -138,6 +158,60 @@ impl Regex {
     /// The pattern this regex was compiled from.
     pub fn as_str(&self) -> &str {
         &self.pattern
+    }
+
+    /// A human-readable rendering of how this pattern was compiled: the
+    /// mode, the chosen execution strategy (literal substring path,
+    /// extracted scan prefix / suffix, or the Pike VM), and the
+    /// instruction listing. Intended for debugging "why doesn't this
+    /// match?".
+    ///
+    /// The output format is **unstable** — it is not part of the semver
+    /// contract and may change in any release.
+    pub fn debug_dump(&self) -> String {
+        use std::fmt::Write;
+        let p = &self.program;
+        let mut out = String::new();
+        let _ = writeln!(out, "pattern: {:?}", self.pattern);
+        let _ = writeln!(
+            out,
+            "mode: {}{}{}",
+            if self.posix {
+                "posix (leftmost-longest)"
+            } else {
+                "leftmost-first"
+            },
+            if p.icase { " + case-insensitive" } else { "" },
+            if p.newline { " + newline" } else { "" },
+        );
+        if let Some(lit) = &p.literal {
+            let _ = writeln!(
+                out,
+                "tier: literal substring path {:?} (anchored start: {}, end: {})",
+                lit.s, lit.anchored_start, lit.anchored_end,
+            );
+            return out;
+        }
+        if !p.prefix.is_empty() {
+            let _ = writeln!(out, "scan prefix: {:?}", p.prefix);
+        }
+        if !p.suffix.is_empty() {
+            let _ = writeln!(
+                out,
+                "required suffix: {:?} (anchored: {})",
+                p.suffix, p.suffix_anchored,
+            );
+        }
+        let _ = writeln!(
+            out,
+            "tier: pike-vm ({} instructions, {} groups)",
+            p.insts.len(),
+            p.group_count,
+        );
+        for (i, inst) in p.insts.iter().enumerate() {
+            let _ = writeln!(out, "{i:5}: {inst:?}");
+        }
+        out
     }
 
     /// Whether `text` contains a match, without computing capture groups.
@@ -274,6 +348,59 @@ impl std::str::FromStr for Regex {
 
     fn from_str(pattern: &str) -> Result<Regex, Error> {
         Regex::new(pattern)
+    }
+}
+
+/// Configures and compiles a [`Regex`] — the general form of the
+/// `new_*` constructors (see [`Regex::builder`]).
+///
+/// ```
+/// let re = rusty_regx::Regex::builder()
+///     .posix(true)
+///     .newline(true)
+///     .build("^ab$")?;
+/// assert!(re.is_match("x\nab\ny")); // ^/$ match at line boundaries
+/// # Ok::<(), rusty_regx::Error>(())
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct RegexBuilder {
+    posix: bool,
+    case_insensitive: bool,
+    newline: bool,
+}
+
+impl RegexBuilder {
+    /// Equivalent to [`RegexBuilder::default`].
+    pub fn new() -> RegexBuilder {
+        RegexBuilder::default()
+    }
+
+    /// POSIX leftmost-longest match semantics, as [`Regex::new_posix`].
+    pub fn posix(mut self, yes: bool) -> RegexBuilder {
+        self.posix = yes;
+        self
+    }
+
+    /// `REG_ICASE` case-insensitive matching, as [`Regex::new_posix_ci`] /
+    /// [`Regex::new_ci`].
+    pub fn case_insensitive(mut self, yes: bool) -> RegexBuilder {
+        self.case_insensitive = yes;
+        self
+    }
+
+    /// POSIX `REG_NEWLINE` mode: `.` and negated bracket expressions do
+    /// not match `\n`, and `^`/`$` also match right after/before one —
+    /// grep-style line-oriented matching over multi-line text. bash's
+    /// `=~` does *not* use this mode; it exists for grep-shaped
+    /// consumers.
+    pub fn newline(mut self, yes: bool) -> RegexBuilder {
+        self.newline = yes;
+        self
+    }
+
+    /// Compiles `pattern` with the configured options.
+    pub fn build(&self, pattern: &str) -> Result<Regex, Error> {
+        Regex::compile_full(pattern, self.posix, self.case_insensitive, self.newline)
     }
 }
 

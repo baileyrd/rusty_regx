@@ -114,9 +114,10 @@ enum Step {
 fn step(program: &Program, pc: usize, c: Option<char>, fc: Option<char>) -> Step {
     match program.insts[pc] {
         Inst::Char(x) if fc == Some(x) => Step::Advance,
-        Inst::AnyChar if c.is_some() => Step::Advance,
+        Inst::ScanAny if c.is_some() => Step::Advance,
+        Inst::AnyChar if c.is_some() && !(program.newline && c == Some('\n')) => Step::Advance,
         Inst::Class(i) if fc.is_some_and(|ch| program.classes[i].matches(ch)) => Step::Advance,
-        Inst::Char(_) | Inst::AnyChar | Inst::Class(_) => Step::Die,
+        Inst::Char(_) | Inst::ScanAny | Inst::AnyChar | Inst::Class(_) => Step::Die,
         Inst::Match => Step::Matched,
         // Epsilon instructions are resolved inside the closures.
         Inst::Split { .. }
@@ -355,12 +356,12 @@ fn add_thread(
                 stack.push((pc + 1, slots));
             }
             Inst::StartAnchor => {
-                if pos == 0 {
+                if pos == 0 || (program.newline && prev == Some('\n')) {
                     stack.push((pc + 1, slots));
                 }
             }
             Inst::EndAnchor => {
-                if pos == len {
+                if pos == len || (program.newline && next == Some('\n')) {
                     stack.push((pc + 1, slots));
                 }
             }
@@ -384,7 +385,7 @@ fn add_thread(
                     stack.push((pc + 1, slots));
                 }
             }
-            Inst::Char(_) | Inst::AnyChar | Inst::Class(_) | Inst::Match => {
+            Inst::Char(_) | Inst::ScanAny | Inst::AnyChar | Inst::Class(_) | Inst::Match => {
                 list.push((pc, slots));
             }
         }
@@ -497,12 +498,12 @@ fn add_thread_bool(
             }
             Inst::Save(_) => stack.push(pc + 1),
             Inst::StartAnchor => {
-                if pos == 0 {
+                if pos == 0 || (program.newline && prev == Some('\n')) {
                     stack.push(pc + 1);
                 }
             }
             Inst::EndAnchor => {
-                if pos == len {
+                if pos == len || (program.newline && next == Some('\n')) {
                     stack.push(pc + 1);
                 }
             }
@@ -526,7 +527,7 @@ fn add_thread_bool(
                     stack.push(pc + 1);
                 }
             }
-            Inst::Char(_) | Inst::AnyChar | Inst::Class(_) | Inst::Match => {
+            Inst::Char(_) | Inst::ScanAny | Inst::AnyChar | Inst::Class(_) | Inst::Match => {
                 list.push(pc);
             }
         }
@@ -705,7 +706,7 @@ fn closure_posix(
             best_gen[pc] = gen;
             if matches!(
                 program.insts[pc],
-                Inst::Char(_) | Inst::AnyChar | Inst::Class(_) | Inst::Match
+                Inst::Char(_) | Inst::ScanAny | Inst::AnyChar | Inst::Class(_) | Inst::Match
             ) {
                 order.push(pc);
             }
@@ -725,12 +726,12 @@ fn closure_posix(
                 stack.push((pc + 1, slots));
             }
             Inst::StartAnchor => {
-                if pos == 0 {
+                if pos == 0 || (program.newline && prev == Some('\n')) {
                     stack.push((pc + 1, slots));
                 }
             }
             Inst::EndAnchor => {
-                if pos == len {
+                if pos == len || (program.newline && next == Some('\n')) {
                     stack.push((pc + 1, slots));
                 }
             }
@@ -754,7 +755,7 @@ fn closure_posix(
                     stack.push((pc + 1, slots));
                 }
             }
-            Inst::Char(_) | Inst::AnyChar | Inst::Class(_) | Inst::Match => {}
+            Inst::Char(_) | Inst::ScanAny | Inst::AnyChar | Inst::Class(_) | Inst::Match => {}
         }
     }
 }
