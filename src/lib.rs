@@ -140,6 +140,7 @@ impl Regex {
     /// Starts building a regex with non-default options — the general
     /// form of the `new_*` constructors, plus options they don't cover
     /// (currently [`RegexBuilder::newline`]).
+    #[must_use]
     pub fn builder() -> RegexBuilder {
         RegexBuilder::default()
     }
@@ -379,11 +380,17 @@ pub struct RegexBuilder {
 
 impl RegexBuilder {
     /// Equivalent to [`RegexBuilder::default`].
+    #[must_use]
     pub fn new() -> RegexBuilder {
         RegexBuilder::default()
     }
 
     /// POSIX leftmost-longest match semantics, as [`Regex::new_posix`].
+    ///
+    /// Consumes and returns `self`: like the other setters, dropping the
+    /// result (`builder.posix(true);` instead of `builder =
+    /// builder.posix(true);`) silently no-ops, so this is `#[must_use]`.
+    #[must_use]
     pub fn posix(mut self, yes: bool) -> RegexBuilder {
         self.posix = yes;
         self
@@ -391,6 +398,7 @@ impl RegexBuilder {
 
     /// `REG_ICASE` case-insensitive matching, as [`Regex::new_posix_ci`] /
     /// [`Regex::new_ci`].
+    #[must_use]
     pub fn case_insensitive(mut self, yes: bool) -> RegexBuilder {
         self.case_insensitive = yes;
         self
@@ -401,6 +409,7 @@ impl RegexBuilder {
     /// grep-style line-oriented matching over multi-line text. bash's
     /// `=~` does *not* use this mode; it exists for grep-shaped
     /// consumers.
+    #[must_use]
     pub fn newline(mut self, yes: bool) -> RegexBuilder {
         self.newline = yes;
         self
@@ -414,7 +423,7 @@ impl RegexBuilder {
 
 /// The location of a single match in the searched text (see
 /// [`Regex::find`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Match<'t> {
     text: &'t str,
     start: usize,

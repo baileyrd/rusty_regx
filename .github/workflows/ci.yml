@@ -55,6 +55,46 @@ jobs:
       - name: Test on MSRV
         run: cargo test --all-targets
 
+  # The crate's headline trust story is "zero runtime dependencies"; this
+  # substantiates it end-to-end by checking that the dev-dependency
+  # (`regex`, used only by tests/benches) and the fuzz crate's dependencies
+  # stay free of published RustSec advisories.
+  audit:
+    name: Security audit (cargo-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit main crate (dev-dependencies)
+        run: cargo audit
+      - name: Audit fuzz crate
+        run: cargo audit --file fuzz/Cargo.lock
+
+  # Catches UB-adjacent logic bugs (out-of-bounds slicing, invalid char
+  # boundaries) that pass under the normal test runner. Scoped to `--lib`
+  # only: the integration suite (tests/matching.rs) times a linear-time
+  # guarantee against wall-clock thresholds that don't hold under Miri's
+  # interpreter overhead, and tests/differential.rs shells out to bash,
+  # which Miri doesn't support — both would need restructuring to run
+  # meaningfully under Miri, so this stays scoped to what already does.
+  miri:
+    name: Miri (lib)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Miri
+        run: |
+          rustup toolchain install nightly --component miri
+          rustup default nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Miri on lib tests
+        run: cargo miri test --lib
+
   fuzz:
     name: Fuzz (smoke)
     runs-on: ubuntu-latest

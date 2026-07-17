@@ -13,7 +13,10 @@
 //!   POSIX's literal-backslash rule applies, as in glibc).
 //! - `\b` `\B` word boundary / non-boundary, `\<` `\>` word start/end.
 //!   Quantifying one directly is an error, as in glibc.
-//! - `` \` `` and `\'` = start/end of input.
+//! - `` \` `` and `\'` = absolute start/end of the buffer — unlike `^`/`$`,
+//!   which under `REG_NEWLINE` also match right after/before any `\n`,
+//!   `` \` ``/`\'` always mean true position 0 / true end of input, no
+//!   matter the mode (bash-verified).
 //! - `{,n}` = `{0,n}`, and `{,}` = `*`.
 //!
 //! Deliberate choices where POSIX leaves behavior undefined:
@@ -32,18 +35,40 @@
 //!   the C/UTF-8 locales bash runs in); a collating symbol may be a range
 //!   endpoint, an equivalence class may not, and multi-char collating
 //!   names are errors — all as glibc behaves (bash-verified).
-//! - Groups may nest at most [`MAX_NESTING_DEPTH`] deep; beyond that the
-//!   pattern is rejected rather than risking a stack overflow.
+//! - Groups may nest at most [`MAX_NESTING_DEPTH`] deep, and quantifiers may
+//!   stack (`a****…`, `a{2}{2}{2}…`) at most that deep too — the two share
+//!   one cap, since either alone (or a mix) recurses the same downstream AST
+//!   walks; beyond it the pattern is rejected rather than risking a stack
+//!   overflow.
 
 use crate::ast::{Ast, Class, PosixClass};
+use crate::compile::MAX_REPETITION_SIZE;
 use crate::error::{Error, ErrorKind};
 
-/// Cap on group-nesting depth. The parser recurses per nesting level (as do
-/// the compiler's AST walks and the AST's own `Drop`), so without a cap a
-/// user-supplied pattern like `((((…` overflows the stack and aborts the
-/// process — the shell must survive any pattern. 250 matches the `regex`
+/// Cap on structural AST nesting depth: how many `Group`/`Repeat` wrappers
+/// deep a single chain gets, whether from parenthesis nesting (`((((…`),
+/// quantifier stacking (`a****…`, `a{2}{2}{2}…`), or any mix of the two. The
+/// parser recurses per group-nesting level while parsing (checked eagerly
+/// below, at `(`, so a pathological `(((((…` can't overflow the parser's own
+/// stack before this check ever runs); the compiler's AST walks and the
+/// AST's own `Drop` then recurse per `Group`/`Repeat` level over the
+/// *constructed* tree, so quantifier stacking needs the same cap even though
+/// it never recurses in the parser itself — without it, `a` followed by a
+/// few thousand `*` builds an arbitrarily deep `Repeat` chain with nothing
+/// to stop it and aborts the process downstream. 250 matches the `regex`
 /// crate's default `nest_limit`.
 const MAX_NESTING_DEPTH: u32 = 250;
+
+/// Rejects a structural depth beyond the cap. `depth` is the depth the node
+/// being constructed *would* have (child depth + 1); `at` is the position to
+/// blame.
+fn check_depth(depth: u32, at: usize) -> Result<(), Error> {
+    if depth > MAX_NESTING_DEPTH {
+        Err(Error::new(ErrorKind::NestingTooDeep, Some(at)))
+    } else {
+        Ok(())
+    }
+}
 
 /// Parses an ERE pattern into an [`Ast`].
 pub fn parse(pattern: &str) -> Result<Ast, Error> {
@@ -54,7 +79,7 @@ pub fn parse(pattern: &str) -> Result<Ast, Error> {
         group_count: 0,
         depth: 0,
     };
-    let ast = parser.alternation()?;
+    let (ast, _depth) = parser.alternation()?;
     if parser.byte_pos < pattern.len() {
         // alternation() only stops early on `)`.
         return Err(Error::new(
@@ -138,22 +163,28 @@ impl Parser<'_> {
         }
     }
 
-    /// `alternation := concat ('|' concat)*`
-    fn alternation(&mut self) -> Result<Ast, Error> {
+    /// `alternation := concat ('|' concat)*`. Returns the branches' greatest
+    /// structural depth alongside the `Ast` (an `Alternation` node itself
+    /// adds no depth: only one branch is ever on the call stack at a time).
+    fn alternation(&mut self) -> Result<(Ast, u32), Error> {
         let mut branches = vec![self.concat()?];
         while self.eat('|') {
             branches.push(self.concat()?);
         }
-        Ok(if branches.len() == 1 {
-            branches.pop().unwrap()
+        let depth = branches.iter().map(|(_, d)| *d).max().unwrap_or(0);
+        let ast = if branches.len() == 1 {
+            branches.pop().unwrap().0
         } else {
-            Ast::Alternation(branches)
-        })
+            Ast::Alternation(branches.into_iter().map(|(ast, _)| ast).collect())
+        };
+        Ok((ast, depth))
     }
 
     /// `concat := (atom quantifier*)*` — ends at `|`, `)`, or end of input.
-    fn concat(&mut self) -> Result<Ast, Error> {
-        let mut items: Vec<Ast> = Vec::new();
+    /// Returns the items' greatest structural depth (a `Concat` node itself
+    /// adds no depth, for the same reason as `Alternation`).
+    fn concat(&mut self) -> Result<(Ast, u32), Error> {
+        let mut items: Vec<(Ast, u32)> = Vec::new();
         loop {
             match self.peek() {
                 None | Some('|') | Some(')') => break,
@@ -163,45 +194,62 @@ impl Parser<'_> {
                 Some('{') => {
                     let at = self.char_pos;
                     let (min, max) = self.interval()?;
-                    let ast = items
+                    let (ast, depth) = items
                         .pop()
                         .ok_or(Error::new(ErrorKind::DanglingQuantifier, Some(at)))?;
                     reject_quantified_assertion(&ast, at)?;
-                    items.push(Ast::Repeat {
-                        ast: Box::new(ast),
-                        min,
-                        max,
-                        slot: 0,
-                    });
+                    let depth = depth + 1;
+                    check_depth(depth, at)?;
+                    items.push((
+                        Ast::Repeat {
+                            ast: Box::new(ast),
+                            min,
+                            max,
+                            slot: 0,
+                        },
+                        depth,
+                    ));
                 }
                 Some(_) => items.push(self.atom()?),
             }
         }
-        Ok(match items.len() {
+        let depth = items.iter().map(|(_, d)| *d).max().unwrap_or(0);
+        let ast = match items.len() {
             0 => Ast::Empty,
-            1 => items.pop().unwrap(),
-            _ => Ast::Concat(items),
-        })
+            1 => items.pop().unwrap().0,
+            _ => Ast::Concat(items.into_iter().map(|(ast, _)| ast).collect()),
+        };
+        Ok((ast, depth))
     }
 
     /// Applies `* + ?` (already peeked) to the preceding atom.
-    fn quantify(&mut self, items: &mut Vec<Ast>, min: u32, max: Option<u32>) -> Result<(), Error> {
+    fn quantify(
+        &mut self,
+        items: &mut Vec<(Ast, u32)>,
+        min: u32,
+        max: Option<u32>,
+    ) -> Result<(), Error> {
         let at = self.char_pos;
         self.bump();
-        let ast = items
+        let (ast, depth) = items
             .pop()
             .ok_or(Error::new(ErrorKind::DanglingQuantifier, Some(at)))?;
         reject_quantified_assertion(&ast, at)?;
-        items.push(Ast::Repeat {
-            ast: Box::new(ast),
-            min,
-            max,
-            slot: 0,
-        });
+        let depth = depth + 1;
+        check_depth(depth, at)?;
+        items.push((
+            Ast::Repeat {
+                ast: Box::new(ast),
+                min,
+                max,
+                slot: 0,
+            },
+            depth,
+        ));
         Ok(())
     }
 
-    fn atom(&mut self) -> Result<Ast, Error> {
+    fn atom(&mut self) -> Result<(Ast, u32), Error> {
         match self.bump().expect("atom() called with input remaining") {
             '(' => {
                 let open = self.char_pos - 1;
@@ -211,43 +259,51 @@ impl Parser<'_> {
                 }
                 self.group_count += 1;
                 let index = self.group_count;
-                let inner = self.alternation()?;
+                let (inner, inner_depth) = self.alternation()?;
                 if !self.eat(')') {
                     return Err(Error::new(ErrorKind::UnbalancedParenthesis, Some(open)));
                 }
                 self.depth -= 1;
-                Ok(Ast::Group(index, Box::new(inner)))
+                let depth = inner_depth + 1;
+                check_depth(depth, open)?;
+                Ok((Ast::Group(index, Box::new(inner)), depth))
             }
-            '[' => self.bracket(),
-            '.' => Ok(Ast::AnyChar),
-            '^' => Ok(Ast::StartAnchor),
-            '$' => Ok(Ast::EndAnchor),
+            '[' => Ok((self.bracket()?, 0)),
+            '.' => Ok((Ast::AnyChar, 0)),
+            '^' => Ok((Ast::StartAnchor, 0)),
+            '$' => Ok((Ast::EndAnchor, 0)),
             '\\' => match self.bump() {
                 // GNU extensions (glibc regcomp; what bash =~ accepts).
-                Some('w') => Ok(word_class(false)),
-                Some('W') => Ok(word_class(true)),
-                Some('s') => Ok(space_class(false)),
-                Some('S') => Ok(space_class(true)),
-                Some('b') => Ok(Ast::WordBoundary),
-                Some('B') => Ok(Ast::NotWordBoundary),
-                Some('<') => Ok(Ast::WordStart),
-                Some('>') => Ok(Ast::WordEnd),
-                Some('`') => Ok(Ast::StartAnchor),
-                Some('\'') => Ok(Ast::EndAnchor),
-                Some(c) => Ok(Ast::Char(c)),
+                Some('w') => Ok((word_class(false), 0)),
+                Some('W') => Ok((word_class(true), 0)),
+                Some('s') => Ok((space_class(false), 0)),
+                Some('S') => Ok((space_class(true), 0)),
+                Some('b') => Ok((Ast::WordBoundary, 0)),
+                Some('B') => Ok((Ast::NotWordBoundary, 0)),
+                Some('<') => Ok((Ast::WordStart, 0)),
+                Some('>') => Ok((Ast::WordEnd, 0)),
+                Some('`') => Ok((Ast::BufferStart, 0)),
+                Some('\'') => Ok((Ast::BufferEnd, 0)),
+                Some(c) => Ok((Ast::Char(c), 0)),
                 None => Err(Error::new(
                     ErrorKind::TrailingBackslash,
                     Some(self.char_pos - 1),
                 )),
             },
-            c => Ok(Ast::Char(c)),
+            c => Ok((Ast::Char(c), 0)),
         }
     }
 
     /// Parses `{m}`, `{m,}`, or `{m,n}`; the leading `{` has been peeked.
+    /// A bound past [`MAX_REPETITION_SIZE`] is rejected here too — purely
+    /// syntactic (the interval's own written bound, independent of any
+    /// nesting), so unlike the compiler's backstop check for interactions
+    /// between intervals (`(a{1000}){1000}`), this one can carry a
+    /// position.
     fn interval(&mut self) -> Result<(u32, Option<u32>), Error> {
         let open = self.char_pos;
         let err = || Error::new(ErrorKind::InvalidInterval, Some(open));
+        let too_large = || Error::new(ErrorKind::RepetitionTooLarge, Some(open));
         self.bump();
         // GNU: `{,n}` means `{0,n}` (and `{,}` means `*`), as in glibc.
         let min = if self.peek() == Some(',') {
@@ -256,13 +312,21 @@ impl Parser<'_> {
             self.integer(open)?
         };
         if self.eat('}') {
-            return Ok((min, Some(min)));
+            return if min > MAX_REPETITION_SIZE {
+                Err(too_large())
+            } else {
+                Ok((min, Some(min)))
+            };
         }
         if !self.eat(',') {
             return Err(err());
         }
         if self.eat('}') {
-            return Ok((min, None));
+            return if min > MAX_REPETITION_SIZE {
+                Err(too_large())
+            } else {
+                Ok((min, None))
+            };
         }
         let max = self.integer(open)?;
         if !self.eat('}') {
@@ -270,6 +334,9 @@ impl Parser<'_> {
         }
         if min > max {
             return Err(err());
+        }
+        if min > MAX_REPETITION_SIZE || max > MAX_REPETITION_SIZE {
+            return Err(too_large());
         }
         Ok((min, Some(max)))
     }
@@ -694,6 +761,32 @@ mod tests {
         // never a stack overflow (this used to abort the process).
         let pathological = "(".repeat(500_000);
         assert_eq!(err(&pathological), ErrorKind::NestingTooDeep);
+    }
+
+    #[test]
+    fn stacked_quantifier_depth_is_capped() {
+        // Stacked postfix quantifiers build a `Repeat` chain just like
+        // nested groups do, and share the same cap (they used to be
+        // uncapped and could abort the process — this is the same crash
+        // class as `nesting_depth_is_capped`, reached via `*` instead of
+        // `(`).
+        let deep = "a".to_string() + &"*".repeat(250);
+        assert!(parse(&deep).is_ok());
+        let too_deep = "a".to_string() + &"*".repeat(251);
+        assert_eq!(err(&too_deep), ErrorKind::NestingTooDeep);
+        // `{2}` stacking hits the same cap.
+        let deep_interval = "a".to_string() + &"{2}".repeat(250);
+        assert!(parse(&deep_interval).is_ok());
+        let too_deep_interval = "a".to_string() + &"{2}".repeat(251);
+        assert_eq!(err(&too_deep_interval), ErrorKind::NestingTooDeep);
+        // The original crash case, via quantifiers instead of parens.
+        let pathological = "a".to_string() + &"*".repeat(500_000);
+        assert_eq!(err(&pathological), ErrorKind::NestingTooDeep);
+        // Mixed group + quantifier nesting shares the same combined cap.
+        let mixed = "(".repeat(125) + "a" + &")".repeat(125) + &"*".repeat(125);
+        assert!(parse(&mixed).is_ok());
+        let mixed_too_deep = "(".repeat(125) + "a" + &")".repeat(125) + &"*".repeat(126);
+        assert_eq!(err(&mixed_too_deep), ErrorKind::NestingTooDeep);
     }
 
     #[test]

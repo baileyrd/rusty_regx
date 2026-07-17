@@ -12,6 +12,18 @@ All notable changes to this crate are documented here. The format follows
   types; a REG_NEWLINE differential oracle vs the crate's `(?m)`;
   mode-randomized fuzzing with `find_iter` invariants; GitHub Release
   automation on tag push (body extracted from RELEASE_NOTES.md).
+- `Match` now derives `PartialEq`, `Eq`, `Hash`, so matches can be
+  deduplicated in a `HashSet` or compared directly.
+- CI: a `cargo audit` job checks the dev-dependency and fuzz crate against
+  published RustSec advisories, substantiating the "zero runtime
+  dependencies" story end-to-end; a Miri job runs the lib unit tests
+  (scoped there — the integration suite's linear-time timing assertions
+  and bash-shelling differential oracle don't hold up under Miri's
+  interpreter overhead).
+- `RepetitionTooLarge` now carries a position when the offending interval's
+  own bound is too large (`a{1001}`) — only the aggregate case (nested
+  intervals whose combined expansion exceeds the program-size cap) stays
+  positionless, since no single `{...}` is at fault there.
 
 ### Performance
 
@@ -21,6 +33,13 @@ All notable changes to this crate are documented here. The format follows
   class bitmaps (~40×); one-shot calls share a thread-local scratch
   (allocation-free after warmup); degenerate classes (`[a]`) compile to
   plain chars.
+- Case-insensitive patterns now get the suffix quick-reject fast path too
+  (previously `icase` disabled it entirely, even with a mandatory literal
+  tail like `foo[0-9]+bar$`).
+- ASCII-only case-insensitive literal patterns (`Regex::new_ci("qzj-lit")`)
+  now take the substring fast path instead of always running the full VM;
+  non-ASCII icase literals still fall back to the VM (Unicode case folding
+  isn't byte-length-preserving).
 
 ### Fixed
 
@@ -28,6 +47,13 @@ All notable changes to this crate are documented here. The format follows
   patterns when the scan fast-forward skipped: the boolean path carried
   a thread list embedding the old position's `\b` verdict. It now
   re-seeds after every skip, like the capture paths.
+- A pattern with enough stacked quantifiers (`a****…`, `a{2}{2}{2}…`)
+  built an arbitrarily deep `Repeat` chain with no cap, and could abort
+  the process with a stack overflow — the existing group-nesting depth
+  cap now also covers quantifier stacking (and any mix of the two).
+- `` \` ``/`\'` (GNU absolute buffer anchors) were parsed identically to
+  `^`/`$`, so under `REG_NEWLINE` mode they incorrectly matched at every
+  line boundary instead of only the true start/end of the whole input.
 
 ## [0.4.0] — 2026-07-17
 

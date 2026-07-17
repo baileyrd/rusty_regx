@@ -99,6 +99,16 @@ fn main() {
         time(2_000, || theirs_word.captures(&text).is_some()),
     );
 
+    // ASCII icase literal: the fast path (byte-level ASCII case fold)
+    // versus falling back to the VM (what non-ASCII icase literals still do).
+    let ours_ci_lit = rusty_regx::Regex::new_ci("qzj-lit").unwrap();
+    let theirs_ci_lit = regex::Regex::new("(?i)qzj-lit").unwrap();
+    row(
+        "captures, icase literal 96KB no-match",
+        time(2_000, || ours_ci_lit.captures(&text).is_some()),
+        time(2_000, || theirs_ci_lit.captures(&text).is_some()),
+    );
+
     // Word-boundary pattern — the idiomatic GNU shape (the crate's \b is
     // Unicode-aware but identical over ASCII).
     let ours_wb = rusty_regx::Regex::new(r"\bword\b").unwrap();

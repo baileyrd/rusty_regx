@@ -33,10 +33,16 @@ pub enum Inst {
     ScanAny,
     /// Match one character against `Program::classes[i]`.
     Class(usize),
-    /// Assert start of input.
+    /// Assert start of input (or, under `REG_NEWLINE`, right after a `\n`).
     StartAnchor,
-    /// Assert end of input.
+    /// Assert end of input (or, under `REG_NEWLINE`, right before a `\n`).
     EndAnchor,
+    /// Assert true start of input, unconditionally — `` \` ``, immune to
+    /// `REG_NEWLINE`.
+    BufferStart,
+    /// Assert true end of input, unconditionally — `\'`, immune to
+    /// `REG_NEWLINE`.
+    BufferEnd,
     /// Assert a GNU word boundary (exactly one adjacent char is a word char).
     WordBoundary,
     /// Assert a GNU non-boundary.
@@ -146,11 +152,17 @@ pub struct Program {
     pub prefix: String,
     /// Set when the whole pattern is a plain literal (optionally anchored
     /// at either end): the VM bypasses NFA simulation entirely and
-    /// matches by substring search. Never set in `icase` mode.
+    /// matches by substring search. In `icase` mode this is only set when
+    /// the literal is ASCII-only (`Literal::icase`): ASCII case folding is
+    /// exactly `to_ascii_uppercase`/`to_ascii_lowercase`, always one byte
+    /// per char, so the substring search can stay a plain byte scan; a
+    /// literal with any non-ASCII char falls back to the VM instead, since
+    /// general Unicode folding isn't byte-length-preserving.
     pub literal: Option<Literal>,
-    /// The literal string every match must end with (empty if none):
-    /// a no-match rejects with one substring scan before any VM work.
-    /// Empty in `icase` mode.
+    /// The literal string every match must end with (empty if none): a
+    /// no-match rejects with one substring scan before any VM work. In
+    /// `icase` mode the chars are pre-folded and the VM scans by folding
+    /// each input char, same as `prefix`.
     pub suffix: String,
     /// Whether every match must end at the input's end (`$` on every
     /// branch) — upgrades the suffix check from `contains` to
@@ -172,10 +184,23 @@ pub struct Program {
 pub struct Literal {
     /// The literal text.
     pub s: String,
-    /// Whether the pattern began with `^`.
+    /// Whether the pattern began with `^` or `` \` ``.
     pub anchored_start: bool,
-    /// Whether the pattern ended with `$`.
+    /// Whether the pattern ended with `$` or `\'`.
     pub anchored_end: bool,
+    /// Whether `anchored_start` came from `` \` `` rather than `^`: the
+    /// substring path always checks true position 0, which is exactly
+    /// right for `` \` `` under `REG_NEWLINE` but wrong for `^` (which
+    /// there also matches right after a `\n`) — the caller must exclude
+    /// the `^` case under that mode, but not this one.
+    pub start_absolute: bool,
+    /// The `\'` counterpart of `start_absolute`.
+    pub end_absolute: bool,
+    /// `REG_ICASE` mode: `s` is unfolded (unlike `prefix`/`suffix`), and
+    /// the VM compares it byte-for-byte ASCII-case-insensitively. Only
+    /// ever `true` when `s` is ASCII (checked by the caller before this
+    /// literal is kept at all — see `Program::literal`).
+    pub icase: bool,
 }
 
 /// The `REG_ICASE` case fold: simple (single-character) uppercase mapping.
@@ -210,8 +235,9 @@ pub fn compile(mut ast: Ast, icase: bool, newline: bool) -> Result<Program, Erro
     number(&mut ast, &mut next_slot, &mut tag_order);
 
     // Under REG_NEWLINE, `^` matches after any newline, so the
-    // anchored-at-0 fast path doesn't apply.
-    let anchored = starts_anchored(&ast) && !newline;
+    // anchored-at-0 fast path doesn't apply — but `` \` `` still does,
+    // since it always means true position 0 regardless of mode.
+    let anchored = starts_anchored(&ast, newline);
     let mut c = Compiler {
         insts: Vec::new(),
         classes: Vec::new(),
@@ -241,13 +267,16 @@ pub fn compile(mut ast: Ast, icase: bool, newline: bool) -> Result<Program, Erro
         }
     }
     let mut suffix = String::new();
-    if !icase {
-        collect_suffix_rev(&ast, &mut suffix);
-        suffix = suffix.chars().rev().collect();
+    collect_suffix_rev(&ast, &mut suffix);
+    suffix = suffix.chars().rev().collect();
+    if icase {
+        // The VM compares folded chars; pre-fold the needle to match (same
+        // reasoning as the prefix, just at the tail).
+        suffix = suffix.chars().map(fold).collect();
     }
-    // Under REG_NEWLINE, `\$` also matches before a newline, so the
-    // suffix may sit anywhere — keep the contains() check only.
-    let suffix_anchored = ends_anchored(&ast) && !newline;
+    // Under REG_NEWLINE, `$` also matches before a newline, so the suffix
+    // may sit anywhere — keep the contains() check only. `\'` is unaffected.
+    let suffix_anchored = ends_anchored(&ast, newline);
     // Groups need real capture tracking; the substring path reports only
     // group 0.
     // Class-head scan hint: only when no literal prefix exists (the
@@ -264,12 +293,28 @@ pub fn compile(mut ast: Ast, icase: bool, newline: bool) -> Result<Program, Erro
                 index
             })
     };
-    let literal = if icase || group_count > 1 {
+    let literal = if group_count > 1 {
         None
     } else {
-        // Anchored literals assume `^`/`$` mean input start/end, which
-        // REG_NEWLINE changes; unanchored literals stay valid.
-        literal_of(&ast).filter(|l| !newline || (!l.anchored_start && !l.anchored_end))
+        // The substring path always checks true position 0 / true end of
+        // input — exactly right for `` \` ``/`\'`, but wrong for `^`/`$`
+        // under REG_NEWLINE (which also match around embedded newlines).
+        // Only exclude the `^`/`$` case, not the `` \` ``/`\' `` one.
+        literal_of(&ast)
+            .filter(|l| {
+                !newline
+                    || ((!l.anchored_start || l.start_absolute)
+                        && (!l.anchored_end || l.end_absolute))
+            })
+            // Unicode case folding isn't byte-length-preserving (e.g. `ß`
+            // folds to `SS`), so the substring path only stays exact for
+            // icase when the literal is ASCII — where folding is always
+            // `to_ascii_uppercase`, one byte per char, both directions.
+            .filter(|l| !icase || l.s.is_ascii())
+            .map(|mut l| {
+                l.icase = icase;
+                l
+            })
     };
     Ok(Program {
         insts: c.insts,
@@ -308,14 +353,33 @@ fn literal_of(ast: &Ast) -> Option<Literal> {
         s: String::new(),
         anchored_start: false,
         anchored_end: false,
+        icase: false,
+        start_absolute: false,
+        end_absolute: false,
     };
-    if let Some(Ast::StartAnchor) = items.first() {
-        lit.anchored_start = true;
-        items = &items[1..];
+    match items.first() {
+        Some(Ast::StartAnchor) => {
+            lit.anchored_start = true;
+            items = &items[1..];
+        }
+        Some(Ast::BufferStart) => {
+            lit.anchored_start = true;
+            lit.start_absolute = true;
+            items = &items[1..];
+        }
+        _ => {}
     }
-    if let Some(Ast::EndAnchor) = items.last() {
-        lit.anchored_end = true;
-        items = &items[..items.len() - 1];
+    match items.last() {
+        Some(Ast::EndAnchor) => {
+            lit.anchored_end = true;
+            items = &items[..items.len() - 1];
+        }
+        Some(Ast::BufferEnd) => {
+            lit.anchored_end = true;
+            lit.end_absolute = true;
+            items = &items[..items.len() - 1];
+        }
+        _ => {}
     }
     // Every remaining item must be *exactly* its literal — Chars, exact
     // repetitions of literals, Empty (the caller has already excluded
@@ -329,15 +393,19 @@ fn literal_of(ast: &Ast) -> Option<Literal> {
 }
 
 /// Whether every match of `ast` must start at position 0 — i.e. every
-/// alternation branch begins with `^`. A `min == 0` repetition head is
-/// never anchored: `(^a)?b` matches `b` anywhere.
-fn starts_anchored(ast: &Ast) -> bool {
+/// alternation branch begins with `^` or `` \` ``. A `min == 0` repetition
+/// head is never anchored: `(^a)?b` matches `b` anywhere. Under
+/// `REG_NEWLINE`, `^` also matches right after a `\n`, so it no longer
+/// forces position 0 — `` \` `` is unaffected, since it always means true
+/// position 0 regardless of mode.
+fn starts_anchored(ast: &Ast, newline: bool) -> bool {
     match ast {
-        Ast::StartAnchor => true,
-        Ast::Concat(items) => items.first().is_some_and(starts_anchored),
-        Ast::Alternation(branches) => branches.iter().all(starts_anchored),
-        Ast::Group(_, inner) => starts_anchored(inner),
-        Ast::Repeat { ast, min, .. } => *min >= 1 && starts_anchored(ast),
+        Ast::StartAnchor => !newline,
+        Ast::BufferStart => true,
+        Ast::Concat(items) => items.first().is_some_and(|a| starts_anchored(a, newline)),
+        Ast::Alternation(branches) => branches.iter().all(|b| starts_anchored(b, newline)),
+        Ast::Group(_, inner) => starts_anchored(inner, newline),
+        Ast::Repeat { ast, min, .. } => *min >= 1 && starts_anchored(ast, newline),
         _ => false,
     }
 }
@@ -402,7 +470,8 @@ fn collect_prefix(ast: &Ast, out: &mut String) -> bool {
         | Ast::NotWordBoundary
         | Ast::WordStart
         | Ast::WordEnd
-        | Ast::StartAnchor => true,
+        | Ast::StartAnchor
+        | Ast::BufferStart => true,
         Ast::Char(c) => {
             out.push(*c);
             true
@@ -449,13 +518,14 @@ fn collect_prefix(ast: &Ast, out: &mut String) -> bool {
 
 /// Whether every match of `ast` must end at the input's end — the mirror
 /// of `starts_anchored`.
-fn ends_anchored(ast: &Ast) -> bool {
+fn ends_anchored(ast: &Ast, newline: bool) -> bool {
     match ast {
-        Ast::EndAnchor => true,
-        Ast::Concat(items) => items.last().is_some_and(ends_anchored),
-        Ast::Alternation(branches) => branches.iter().all(ends_anchored),
-        Ast::Group(_, inner) => ends_anchored(inner),
-        Ast::Repeat { ast, min, .. } => *min >= 1 && ends_anchored(ast),
+        Ast::EndAnchor => !newline,
+        Ast::BufferEnd => true,
+        Ast::Concat(items) => items.last().is_some_and(|a| ends_anchored(a, newline)),
+        Ast::Alternation(branches) => branches.iter().all(|b| ends_anchored(b, newline)),
+        Ast::Group(_, inner) => ends_anchored(inner, newline),
+        Ast::Repeat { ast, min, .. } => *min >= 1 && ends_anchored(ast, newline),
         _ => false,
     }
 }
@@ -470,7 +540,8 @@ fn collect_suffix_rev(ast: &Ast, out: &mut String) -> bool {
         | Ast::NotWordBoundary
         | Ast::WordStart
         | Ast::WordEnd
-        | Ast::EndAnchor => true,
+        | Ast::EndAnchor
+        | Ast::BufferEnd => true,
         Ast::Char(c) => {
             out.push(*c);
             true
@@ -536,6 +607,8 @@ fn number(ast: &mut Ast, next_slot: &mut usize, tag_order: &mut Vec<usize>) {
         | Ast::Class(_)
         | Ast::StartAnchor
         | Ast::EndAnchor
+        | Ast::BufferStart
+        | Ast::BufferEnd
         | Ast::WordBoundary
         | Ast::NotWordBoundary
         | Ast::WordStart
@@ -567,6 +640,8 @@ fn max_group(ast: &Ast) -> u32 {
         | Ast::Class(_)
         | Ast::StartAnchor
         | Ast::EndAnchor
+        | Ast::BufferStart
+        | Ast::BufferEnd
         | Ast::WordBoundary
         | Ast::NotWordBoundary
         | Ast::WordStart
@@ -646,6 +721,12 @@ impl Compiler {
             }
             Ast::EndAnchor => {
                 self.push(Inst::EndAnchor)?;
+            }
+            Ast::BufferStart => {
+                self.push(Inst::BufferStart)?;
+            }
+            Ast::BufferEnd => {
+                self.push(Inst::BufferEnd)?;
             }
             Ast::WordBoundary => {
                 self.push(Inst::WordBoundary)?;

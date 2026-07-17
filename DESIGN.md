@@ -7,7 +7,8 @@ A minimal POSIX-ERE regex engine intended to replace the `regex` crate in
 
 ## Scope
 
-POSIX ERE, nothing more:
+The original plan (v0.1, historical — see "Current state and direction"
+below for what's actually implemented today): POSIX ERE, nothing more.
 
 - Alternation `|`, concatenation, capturing groups `( )` (ERE has no
   non-capturing groups), quantifiers `* + ?` and intervals `{m} {m,} {m,n}`.
@@ -15,9 +16,15 @@ POSIX ERE, nothing more:
 - Bracket expressions: `[^...]`, ranges, literal `]` first (`[]a]`),
   trailing `-`, POSIX classes `[[:alpha:]]` … `[[:xdigit:]]`.
 
-**Out of scope:** backreferences, lookaround, lazy/possessive quantifiers,
-named groups, Perl classes (`\d`, `\w`, `\b`), Unicode property classes,
-replacement APIs, streaming.
+**Out of scope then, in scope now:** `\d`/`\w`/`\b` and the rest of the
+GNU/glibc escape set were "out of scope" at v0.1 — bash's `regcomp` is
+glibc, and real scripts rely on them, so they shipped as GNU extensions
+(see below); **`\d` stays out**, since glibc has no such escape (`\d` is
+literal `d`, matching bash).
+
+**Still out of scope:** backreferences, lookaround, lazy/possessive
+quantifiers, named groups, Unicode property classes, replacement APIs,
+streaming.
 
 ## Public API (mirrors rush's exact usage)
 
