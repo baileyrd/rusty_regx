@@ -90,6 +90,15 @@ fn main() {
         time(2_000, || theirs_lit.captures(&text).is_some()),
     );
 
+    // Pure-literal pattern (what escape() produces): substring fast path.
+    let ours_word = rusty_regx::Regex::new("qzj-lit").unwrap();
+    let theirs_word = regex::Regex::new("qzj-lit").unwrap();
+    row(
+        "captures, literal 96KB no-match",
+        time(2_000, || ours_word.captures(&text).is_some()),
+        time(2_000, || theirs_word.captures(&text).is_some()),
+    );
+
     // Adversarial: catastrophic for backtrackers, must stay flat here.
     let a512 = "a".repeat(512);
     let ours = rusty_regx::Regex::new("(a+)+b").unwrap();

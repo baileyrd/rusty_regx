@@ -23,7 +23,7 @@
 //! by RE2's POSIX mode, matching what bash/glibc report.
 
 use crate::ast::{Class, PosixClass};
-use crate::compile::{fold, Inst, Program};
+use crate::compile::{fold, Inst, Literal, Program};
 use std::rc::Rc;
 
 /// Byte offsets recorded by `Save`; two slots per group.
@@ -33,6 +33,20 @@ use std::rc::Rc;
 /// clone (`Rc::make_mut`). `Rc` never escapes the VM, so `Regex` stays
 /// `Send + Sync`.
 type Slots = Rc<Vec<Option<usize>>>;
+
+/// The substring fast path for pure-literal patterns (see
+/// [`Program::literal`]): the leftmost match's byte span, or `None`.
+/// Leftmost-first and POSIX agree here — a literal has exactly one
+/// possible span per start position.
+fn literal_span(lit: &Literal, text: &str) -> Option<(usize, usize)> {
+    let n = lit.s.len();
+    match (lit.anchored_start, lit.anchored_end) {
+        (true, true) => (text == lit.s).then_some((0, n)),
+        (true, false) => text.starts_with(&lit.s).then_some((0, n)),
+        (false, true) => text.ends_with(&lit.s).then(|| (text.len() - n, text.len())),
+        (false, false) => text.find(&lit.s).map(|i| (i, i + n)),
+    }
+}
 
 /// One thread's outcome stepping over the current input char — the single
 /// point of truth for consuming-instruction dispatch, shared by all three
@@ -82,6 +96,10 @@ fn at_restart(clist: &[(usize, Slots)], restart: &[usize], pos: usize) -> bool {
 /// On a match, returns one `(start, end)` byte-offset pair per capture
 /// group (group 0 first); groups that did not participate are `None`.
 pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>> {
+    if let Some(lit) = &program.literal {
+        // A literal pattern has no groups: group 0 is the only capture.
+        return literal_span(lit, text).map(|span| vec![Some(span)]);
+    }
     let len = text.len();
     let mut clist: Vec<(usize, Slots)> = Vec::new();
     let mut nlist: Vec<(usize, Slots)> = Vec::new();
@@ -117,29 +135,27 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
         // no live thread carries progress (see `at_restart`), nothing can
         // match before the next occurrence of that char — skip straight
         // to it.
-        if let Some(want) = program.prefix_char {
-            if matched.is_none() && at_restart(&clist, &restart, pos) {
-                match text[pos..].find(want) {
-                    Some(0) => {}
-                    Some(off) => {
-                        pos += off;
-                        gen += 1;
-                        clist.clear();
-                        add_thread(
-                            program,
-                            &mut clist,
-                            &mut visited,
-                            gen,
-                            &mut stack,
-                            0,
-                            Rc::new(vec![None; program.slot_count]),
-                            pos,
-                            len,
-                        );
-                    }
-                    // The required char never occurs again: no match.
-                    None => break,
+        if !program.prefix.is_empty() && matched.is_none() && at_restart(&clist, &restart, pos) {
+            match text[pos..].find(&*program.prefix) {
+                Some(0) => {}
+                Some(off) => {
+                    pos += off;
+                    gen += 1;
+                    clist.clear();
+                    add_thread(
+                        program,
+                        &mut clist,
+                        &mut visited,
+                        gen,
+                        &mut stack,
+                        0,
+                        Rc::new(vec![None; program.slot_count]),
+                        pos,
+                        len,
+                    );
                 }
+                // The required prefix never occurs again: no match.
+                None => break,
             }
         }
         let c = text[pos..].chars().next();
@@ -254,6 +270,9 @@ fn add_thread(
 /// identical across leftmost-first and POSIX semantics (both are "does
 /// any match exist?"), so this single path serves every mode.
 pub fn exec_bool(program: &Program, text: &str) -> bool {
+    if let Some(lit) = &program.literal {
+        return literal_span(lit, text).is_some();
+    }
     let len = text.len();
     let mut clist: Vec<usize> = Vec::new();
     let mut nlist: Vec<usize> = Vec::new();
@@ -276,13 +295,11 @@ pub fn exec_bool(program: &Program, text: &str) -> bool {
 
     let mut pos = 0;
     loop {
-        if let Some(want) = program.prefix_char {
-            if clist == restart {
-                match text[pos..].find(want) {
-                    Some(0) => {}
-                    Some(off) => pos += off,
-                    None => return false,
-                }
+        if !program.prefix.is_empty() && clist == restart {
+            match text[pos..].find(&*program.prefix) {
+                Some(0) => {}
+                Some(off) => pos += off,
+                None => return false,
             }
         }
         let c = text[pos..].chars().next();
@@ -374,6 +391,10 @@ struct PosixStep {
 /// candidate runs to completion and the best capture vector wins under
 /// [`posix_better`].
 pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>> {
+    if let Some(lit) = &program.literal {
+        // Fixed-length literal: leftmost-first and leftmost-longest agree.
+        return literal_span(lit, text).map(|span| vec![Some(span)]);
+    }
     let len = text.len();
     let mut st = PosixStep {
         best: vec![None; program.insts.len()],
@@ -393,27 +414,25 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
 
     let mut pos = 0;
     loop {
-        if let Some(want) = program.prefix_char {
-            if best_match.is_none() && at_restart(&clist, &restart, pos) {
-                match text[pos..].find(want) {
-                    Some(0) => {}
-                    Some(off) => {
-                        pos += off;
-                        st.gen += 1;
-                        clist.clear();
-                        closure_posix(
-                            program,
-                            &mut st,
-                            &mut stack,
-                            0,
-                            Rc::new(vec![None; program.slot_count]),
-                            pos,
-                            len,
-                        );
-                        harvest(&mut st, &mut clist);
-                    }
-                    None => break,
+        if !program.prefix.is_empty() && best_match.is_none() && at_restart(&clist, &restart, pos) {
+            match text[pos..].find(&*program.prefix) {
+                Some(0) => {}
+                Some(off) => {
+                    pos += off;
+                    st.gen += 1;
+                    clist.clear();
+                    closure_posix(
+                        program,
+                        &mut st,
+                        &mut stack,
+                        0,
+                        Rc::new(vec![None; program.slot_count]),
+                        pos,
+                        len,
+                    );
+                    harvest(&mut st, &mut clist);
                 }
+                None => break,
             }
         }
         let c = text[pos..].chars().next();
