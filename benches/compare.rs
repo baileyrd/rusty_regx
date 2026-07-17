@@ -170,12 +170,21 @@ fn main() {
 /// baseline to race against. Instead, each row compares a lookaround
 /// pattern against the `rusty_regx`-only pattern that reaches the same
 /// match decision *without* it (consuming the asserted text instead of
-/// asserting it), to isolate lookaround's own overhead: each check
-/// allocates a fresh `Scratch` and runs a full nested `exec_bool` call
-/// (see the "How it's implemented" section of `docs/LOOKAROUND.md`) —
-/// this is deliberately the simplest correct implementation, not an
-/// optimized one, and these numbers are the evidence for whether that
-/// simplicity is affordable enough to build on.
+/// asserting it), to isolate lookaround's own overhead. A single-atom
+/// body (`(?=x)`, `(?<=[0-9])`, `(?=.)`) takes a direct fast path with no
+/// nested VM at all (`LookaroundProg::simple`); anything else falls back
+/// to a fully independent nested sub-program.
+///
+/// Every no-match row below uses a haystack where the lookaround
+/// pattern's scan-hint char and the equivalent pattern's scan-hint class
+/// occur the *same* number of times (verified, not assumed) — a haystack
+/// with a different hit count for each side measures "how many times did
+/// the scan hint fire", not lookaround's own per-check cost. This was a
+/// real mistake caught during development: the shared `text` haystack
+/// below has zero digits but 3000 `x`s, so `[0-9]x`'s scan hint fired
+/// zero times (free) while `(?<=[0-9])x`'s fired 3000 times (real work
+/// every time) — reporting that as "lookbehind costs 4.6x more" was
+/// comparing 0 checks against 3000, not measuring lookbehind at all.
 fn lookaround_benches(text: &str) {
     println!();
     println!(
@@ -198,13 +207,18 @@ fn lookaround_benches(text: &str) {
         time(20, || equiv.is_match(text)),
     );
 
-    // Lookbehind: `(?<=[0-9])x` vs `[0-9]x`.
+    // Lookbehind: `(?<=[0-9])x` vs `[0-9]x`. Uses its own haystack, not
+    // the shared `text` — `text` has zero digits, which would make
+    // `[0-9]x`'s scan hint fire zero times (see the module doc comment).
+    // This one has exactly 3000 digits and 3000 `x`s, never adjacent
+    // (never a match), so both scan hints fire the same number of times.
+    let lb_text: String = "num4 wordx ".repeat(3_000);
     let la = rusty_regx::Regex::new("(?<=[0-9])x").unwrap();
     let equiv = rusty_regx::Regex::new("[0-9]x").unwrap();
     row2(
-        "is_match, (?<=[0-9])x 96KB no-match",
-        time(20, || la.is_match(text)),
-        time(20, || equiv.is_match(text)),
+        "is_match, (?<=[0-9])x 33KB no-match",
+        time(200, || la.is_match(&lb_text)),
+        time(200, || equiv.is_match(&lb_text)),
     );
 
     // With real matches to find, not just a full no-match scan: every hit

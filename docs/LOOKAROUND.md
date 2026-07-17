@@ -168,78 +168,111 @@ process's main thread does).
 `rusty_regx`-only pattern that reaches the same match decision *without*
 lookaround (consuming the asserted text instead of asserting it) — the
 `regex` crate has no lookaround at all, so it isn't a valid baseline
-here. Release-mode numbers (`cargo bench`), 96KB haystack unless noted:
+here. Release-mode numbers (`cargo bench`):
 
 | Pattern | lookaround | equivalent | × |
 | --- | --- | --- | --- |
-| `[0-9]+(?=x)` (no match, full scan) | 56µs | 57µs | 1.0× |
-| `(?<=[0-9])x` (no match, full scan) | 262µs | 57µs | **4.6×** |
-| `[0-9]+(?=x)` (`find_iter`, real matches) | 2.7ms | 3.0ms | 0.9× |
-| `a(?=b(?=c(?=d)))` (3-deep nested) | 1.1ms | 863µs | 1.3× |
-| `^[a-z]+(?=[0-9])` (short string, per-call) | 249ns | 217ns | 1.1× |
+| `[0-9]+(?=x)` (no match, 96KB) | 58µs | 62µs | 1.0× |
+| `(?<=[0-9])x` (no match, 33KB, balanced candidates) | 210µs | 270µs | **0.8×** |
+| `[0-9]+(?=x)` (`find_iter`, real matches, ~60KB) | 2.7ms | 3.0ms | 0.9× |
+| `a(?=b(?=c(?=d)))` (3-deep nested, 96KB) | 1.2ms | 830µs | 1.4× |
+| `^[a-z]+(?=[0-9])` (short string, per-call) | 240ns | 216ns | 1.1× |
 
-These are the numbers *after* adding the single-atom fast path
-(`LookaroundProg::simple`, see above) — the table below the fold shows
-what the always-nested first cut looked like, since the delta is the
-interesting part of the answer.
+These are the numbers after adding the single-atom fast path
+(`LookaroundProg::simple`, see above). An earlier round of this
+benchmark reported the `(?<=[0-9])x` row at **4.6×**, and the round
+before *that* — before the fast path existed — reported **17.8×**. Both
+of those numbers are wrong in a way worth explaining, because finding
+the mistake was more informative than the numbers themselves.
 
-Takeaways:
+### The benchmark mistake, and what it actually showed
 
-- **When the pattern's scan-hint machinery still applies (a mandatory
-  literal/class *before* the lookaround), the overhead is within noise**
-  (0.9×–1.0×): `head_class`/`collect_prefix` were made transparent to
-  `Ast::Lookaround` (matching the existing transparency for
-  word-boundary assertions), so `[0-9]+(?=x)` still fast-forwards the
-  scan exactly like `[0-9]+x` does — the lookahead check itself only
-  runs at the rare positions the hint identifies as candidates, and
-  when it's a single-atom body (as here), that check no longer touches
-  the VM at all.
-- **When the lookaround sits *before* the mandatory literal instead**
-  (`(?<=[0-9])x`, no scan hint of its own — a lookbehind can't be a
-  "mandatory head" a scan hint fast-forwards to, since the hint would
-  need to jump to a position *based on* text that comes before it, which
-  is exactly what the lookbehind is checking), the fast path still cuts
-  the cost from **~18× down to ~4.6×**: every position in the haystack
-  now does one direct char/class comparison instead of a nested
-  `Scratch` allocation + `exec_bool` call. The remaining 4.6× is the
-  honest floor for this shape — checking one adjacent char per position,
-  compared to the general VM's own per-position class check, which is
-  already about as cheap as this engine gets.
-- **Per-call fixed overhead is now negligible** (1.1× on a short
-  string, down from 4.6×): the single-atom fast path has no allocation
-  at all, so what's left is just the cost of one extra branch in the
-  epsilon closure.
-- **Nesting depth doesn't compound as badly as feared** (1.3× for 3
-  levels): each level here is also a single-atom body, so all three take
-  the fast path, and a failing inner assertion short-circuits before any
+The shared 96KB haystack used everywhere else in `benches/compare.rs`
+(`"abc def ghi jkl mno pqr stu vwx ".repeat(3_000)`) has **zero digits**
+and **3000 occurrences of `x`**. Every row's scan-hint acceleration
+depends on how many times its hint character/class actually occurs in
+the haystack — that's the whole point of a scan hint, it lets you skip
+straight to candidates instead of stepping the VM one char at a time.
+On that haystack:
+
+- `[0-9]x`'s hint (find the next digit) fires **zero** times — the scan
+  is one linear bitmap pass that never finds anything to check further,
+  about as cheap as a `is_match` call gets.
+- `(?<=[0-9])x`'s hint (find the next `x`) fires **3000 times** — at
+  each one, real work happens: check the lookbehind, then check `x`.
+
+Reporting "4.6× slower" from that comparison wasn't measuring
+lookbehind's cost at all — it was measuring "0 candidate checks" against
+"3000 candidate checks", on two *different* haystacks that happened to
+share a variable name. Once the comparison uses a haystack where both
+sides' scan hints fire the same number of times (33KB of alternating
+`num4 wordx `, chosen so digits and `x`s each occur exactly 3000 times,
+never adjacent — so neither pattern ever matches, but both do the same
+amount of real per-candidate work), the lookbehind version comes out
+*faster* (0.8×), not slower. The single-atom fast path's direct char/
+class comparison is at least as cheap as the general VM's own
+per-position class check — there was never a large inherent lookbehind
+cost to begin with once the fast path existed; the apparent 4.6× was an
+artifact of an unfair haystack, not a smaller version of the real 17.8×
+architectural gap the *first* number (correctly) identified.
+
+Takeaways, corrected:
+
+- **When the pattern's scan-hint machinery applies on either side**
+  (mandatory literal/class before *or* after the lookaround, checked on
+  a haystack with comparable candidate density), **the overhead is
+  within noise or better** (0.8×–1.1×): `head_class`/`collect_prefix`
+  were made transparent to `Ast::Lookaround` (matching the existing
+  transparency for word-boundary assertions), so a lookahead still
+  fast-forwards the scan exactly like the consuming equivalent does; and
+  the single-atom fast path means a lookbehind gating a literal costs
+  about the same per candidate as an ordinary class check, once you
+  count candidates fairly.
+- **Nesting depth doesn't compound as badly as feared** (1.4× for 3
+  levels): each level here is a single-atom body, so all three take the
+  fast path, and a failing inner assertion short-circuits before any
   deeper check ever runs.
+- **Per-call fixed overhead is negligible** (1.1× on a short string):
+  the single-atom fast path has no allocation at all.
 
 **Bottom line for the "worth upstreaming?" question this branch exists
-to answer:** with the single-atom fast path, lookaround is within noise
-of its lookaround-free equivalent whenever an existing scan hint
-survives past it, and a well-understood ~4.6× in the one case that has
-no hint to inherit (a lookbehind gating a literal) — down from the
-initial ~18×. Both real bugs the benchmark surfaced along the way (the
-literal-fast-path correctness bug, and the suffix-quick-reject quadratic
-blowup) are fixed and pinned by regression tests, and the fast path
-itself is cross-checked against the general path in
-`simple_lookaround_fast_path_matches_general_path`. The remaining
-optimization opportunity — giving lookbehind a scan hint of its own so
-`(?<=[0-9])x` doesn't need to visit *every* position, only "positions
-after a digit" — would need the scan-hint machinery to reason about text
-*before* the current position, which is a more involved change than
-anything done so far; the 4.6× that's left is a reasonable place to stop
-for this experiment.
+to answer:** with the single-atom fast path, this implementation of
+lookaround has no measurable inherent cost over the lookaround-free
+equivalent in any case tested — the overhead this branch originally set
+out to quantify turned out to live entirely in the always-nested first
+cut (17.8×, `Scratch` allocation + full `exec_bool` per check) and in an
+unfair benchmark comparison (the 4.6× reading), not in lookaround
+assertions themselves. Both real bugs the benchmark surfaced along the
+way (the literal-fast-path correctness bug, and the suffix-quick-reject
+quadratic blowup) are fixed and pinned by regression tests, and the fast
+path itself is cross-checked against the general path in
+`simple_lookaround_fast_path_matches_general_path`. What's left
+unoptimized is the *fallback* path (multi-char bodies, alternation,
+nested lookaround beyond what collapses to single-atom checks) — still
+one `Scratch` allocation and one `exec_bool` call per check, not
+measured to be a problem in the cases tested here, but not proven fast
+either; if this graduates past the experiment stage, that's the
+remaining open question, not lookbehind's scan-hint story (which, per
+the above, didn't need closing).
 
 <details>
-<summary>First-cut numbers (always-nested, before the fast path)</summary>
+<summary>Superseded numbers, kept for the record</summary>
+
+First cut (always-nested, no fast path):
 
 | Pattern | lookaround | equivalent | × |
 | --- | --- | --- | --- |
 | `[0-9]+(?=x)` (no match, full scan) | 47µs | 49µs | 1.0× |
-| `(?<=[0-9])x` (no match, full scan) | 839µs | 47µs | 17.8× |
+| `(?<=[0-9])x` (no match, full scan, unfair haystack) | 839µs | 47µs | 17.8× |
 | `[0-9]+(?=x)` (`find_iter`, real matches) | 3.9ms | 2.4ms | 1.6× |
 | `a(?=b(?=c(?=d)))` (3-deep nested) | 1.3ms | 737µs | 1.8× |
 | `^[a-z]+(?=[0-9])` (short string, per-call) | 979ns | 211ns | 4.6× |
+
+After the fast path, still on the unfair haystack (the mistake this
+section explains):
+
+| Pattern | lookaround | equivalent | × |
+| --- | --- | --- | --- |
+| `(?<=[0-9])x` (no match, full scan, unfair haystack) | 262µs | 57µs | 4.6× |
 
 </details>
