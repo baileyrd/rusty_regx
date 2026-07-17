@@ -139,8 +139,8 @@ pub fn exec(program: &Program, text: &str) -> Option<Vec<Option<(usize, usize)>>
                         );
                     }
                 }
-                Inst::Class(class) => {
-                    if fc.is_some_and(|ch| class_matches(class, ch)) {
+                Inst::Class(i) => {
+                    if fc.is_some_and(|ch| class_matches(&program.classes[*i], ch)) {
                         add_thread(
                             program,
                             &mut nlist,
@@ -302,8 +302,8 @@ pub fn exec_bool(program: &Program, text: &str) -> bool {
                         );
                     }
                 }
-                Inst::Class(class) => {
-                    if fc.is_some_and(|ch| class_matches(class, ch)) {
+                Inst::Class(i) => {
+                    if fc.is_some_and(|ch| class_matches(&program.classes[*i], ch)) {
                         add_thread_bool(
                             program,
                             &mut nlist,
@@ -460,8 +460,8 @@ pub fn exec_posix(program: &Program, text: &str) -> Option<Vec<Option<(usize, us
                         );
                     }
                 }
-                Inst::Class(class) => {
-                    if fc.is_some_and(|ch| class_matches(class, ch)) {
+                Inst::Class(i) => {
+                    if fc.is_some_and(|ch| class_matches(&program.classes[*i], ch)) {
                         closure_posix(
                             program,
                             &mut best,
@@ -607,9 +607,12 @@ fn posix_better(program: &Program, a: &Slots, b: &Slots) -> bool {
     false
 }
 
+/// Ranges are compile-time sorted and merged (see `normalize_ranges`), so
+/// membership is a binary search.
 fn class_matches(class: &Class, c: char) -> bool {
-    let hit = class.ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi)
-        || class.posix.iter().any(|&p| posix_matches(p, c));
+    let i = class.ranges.partition_point(|&(lo, _)| lo <= c);
+    let hit =
+        (i > 0 && class.ranges[i - 1].1 >= c) || class.posix.iter().any(|&p| posix_matches(p, c));
     hit != class.negated
 }
 

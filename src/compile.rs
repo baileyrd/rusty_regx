@@ -17,14 +17,18 @@ pub const MAX_REPETITION_SIZE: u32 = 1000;
 pub const MAX_PROGRAM_SIZE: usize = 1 << 16;
 
 /// A single VM instruction.
-#[derive(Debug, Clone)]
+///
+/// Classes live in [`Program::classes`] and are referenced by index, so
+/// instructions stay small and `Copy` and the dispatch loop stays
+/// cache-friendly.
+#[derive(Debug, Clone, Copy)]
 pub enum Inst {
     /// Match one literal character.
     Char(char),
     /// Match any single character.
     AnyChar,
-    /// Match one character against a class.
-    Class(Class),
+    /// Match one character against `Program::classes[i]`.
+    Class(usize),
     /// Assert start of input.
     StartAnchor,
     /// Assert end of input.
@@ -43,6 +47,10 @@ pub enum Inst {
 #[derive(Debug, Clone)]
 pub struct Program {
     pub insts: Vec<Inst>,
+    /// Interned bracket expressions, referenced by `Inst::Class` index.
+    /// Ranges are normalized at compile time: sorted by start and merged,
+    /// so the VM can binary-search them.
+    pub classes: Vec<Class>,
     /// Number of capture groups including group 0.
     pub group_count: usize,
     /// Total `Save` slots: two per group, plus two per repetition (hidden
@@ -101,6 +109,7 @@ pub fn compile(ast: &Ast, icase: bool) -> Result<Program, Error> {
     let anchored = starts_anchored(&ast);
     let mut c = Compiler {
         insts: Vec::new(),
+        classes: Vec::new(),
         icase,
     };
     if !anchored {
@@ -124,6 +133,7 @@ pub fn compile(ast: &Ast, icase: bool) -> Result<Program, Error> {
     };
     Ok(Program {
         insts: c.insts,
+        classes: c.classes,
         group_count,
         slot_count: next_slot,
         tag_order,
@@ -217,7 +227,26 @@ fn max_group(ast: &Ast) -> u32 {
 
 struct Compiler {
     insts: Vec<Inst>,
+    classes: Vec<Class>,
     icase: bool,
+}
+
+/// Sorts ranges by start and merges overlapping or adjacent ones, so
+/// membership tests can binary-search ([`Class`] invariant after
+/// compilation).
+fn normalize_ranges(ranges: &mut Vec<(char, char)>) {
+    ranges.sort_unstable();
+    let mut merged: Vec<(char, char)> = Vec::with_capacity(ranges.len());
+    for &(lo, hi) in ranges.iter() {
+        match merged.last_mut() {
+            // Adjacent counts too: [a-cd-f] is one range.
+            Some(&mut (_, ref mut phi)) if lo as u32 <= *phi as u32 + 1 => {
+                *phi = (*phi).max(hi);
+            }
+            _ => merged.push((lo, hi)),
+        }
+    }
+    *ranges = merged;
 }
 
 impl Compiler {
@@ -245,8 +274,11 @@ impl Compiler {
                 self.push(Inst::AnyChar)?;
             }
             Ast::Class(class) => {
-                let class = self.fold_class(class)?;
-                self.push(Inst::Class(class))?;
+                let mut class = self.fold_class(class)?;
+                normalize_ranges(&mut class.ranges);
+                let index = self.classes.len();
+                self.classes.push(class);
+                self.push(Inst::Class(index))?;
             }
             Ast::StartAnchor => {
                 self.push(Inst::StartAnchor)?;
