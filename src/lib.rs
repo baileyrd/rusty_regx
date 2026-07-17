@@ -146,6 +146,13 @@ impl Regex {
     /// skips capture tracking entirely, and match *existence* does not
     /// depend on the match semantics, so this is the same single fast path
     /// in every mode (including POSIX).
+    ///
+    /// ```
+    /// let re = rusty_regx::Regex::new("[0-9]+")?;
+    /// assert!(re.is_match("build 42"));
+    /// assert!(!re.is_match("no digits"));
+    /// # Ok::<(), rusty_regx::Error>(())
+    /// ```
     pub fn is_match(&self, text: &str) -> bool {
         vm::exec_bool(&self.program, text, 0, &mut vm::Scratch::default())
     }
@@ -196,6 +203,13 @@ impl Regex {
     /// an empty match starting exactly where the previous match ended is
     /// skipped — so `a*` over `"aab"` yields `"aa"` then `""` at the end,
     /// never a zero-width match glued to `"aa"`.
+    ///
+    /// ```
+    /// let re = rusty_regx::Regex::new("[0-9]+")?;
+    /// let nums: Vec<&str> = re.find_iter("1, 22, 333").map(|m| m.as_str()).collect();
+    /// assert_eq!(nums, ["1", "22", "333"]);
+    /// # Ok::<(), rusty_regx::Error>(())
+    /// ```
     pub fn find_iter<'r, 't>(&'r self, text: &'t str) -> FindIter<'r, 't> {
         FindIter {
             re: self,
@@ -207,6 +221,16 @@ impl Regex {
     }
 
     /// As [`Regex::find_iter`], yielding full [`Captures`] per match.
+    ///
+    /// ```
+    /// let re = rusty_regx::Regex::new("([a-z]+)=([0-9]+)")?;
+    /// let pairs: Vec<(&str, &str)> = re
+    ///     .captures_iter("a=1 b=22")
+    ///     .map(|c| (c.get(1).unwrap(), c.get(2).unwrap()))
+    ///     .collect();
+    /// assert_eq!(pairs, [("a", "1"), ("b", "22")]);
+    /// # Ok::<(), rusty_regx::Error>(())
+    /// ```
     pub fn captures_iter<'r, 't>(&'r self, text: &'t str) -> CapturesIter<'r, 't> {
         CapturesIter {
             re: self,
@@ -225,6 +249,13 @@ impl Regex {
     /// groups the pattern has. The span is the same one `captures` would
     /// report as group 0 (in every mode — POSIX leftmost-longest
     /// disambiguates group 0 by its own span first).
+    ///
+    /// ```
+    /// let re = rusty_regx::Regex::new("[0-9]+")?;
+    /// let m = re.find("build 42!").unwrap();
+    /// assert_eq!((m.start(), m.end(), m.as_str()), (6, 8, "42"));
+    /// # Ok::<(), rusty_regx::Error>(())
+    /// ```
     pub fn find<'t>(&self, text: &'t str) -> Option<Match<'t>> {
         self.find_at(text, 0, &mut vm::Scratch::default())
     }
@@ -398,6 +429,14 @@ impl<'t> Captures<'t> {
     /// The byte span `(start, end)` of group `i` in the searched text, or
     /// `None` if the group did not participate in the match (or `i` is out
     /// of range). Both offsets fall on `char` boundaries.
+    ///
+    /// ```
+    /// let re = rusty_regx::Regex::new("(b)(x)?c")?;
+    /// let caps = re.captures("abc").unwrap();
+    /// assert_eq!(caps.span(1), Some((1, 2)));
+    /// assert_eq!(caps.span(2), None); // did not participate
+    /// # Ok::<(), rusty_regx::Error>(())
+    /// ```
     pub fn span(&self, i: usize) -> Option<(usize, usize)> {
         self.slots.get(i).copied().flatten()
     }
@@ -429,6 +468,13 @@ impl std::ops::Index<usize> for Captures<'_> {
 /// Exactly this engine's metacharacters are escaped: `^ $ . [ ] ( ) | * + ? { } \`.
 /// Borrows the input unchanged when it contains none of them — the common
 /// case for shell words — so no allocation happens.
+///
+/// ```
+/// assert_eq!(rusty_regx::escape("1+1=2?"), r"1\+1=2\?");
+/// let re = rusty_regx::Regex::new(&rusty_regx::escape("a.b"))?;
+/// assert!(re.is_match("xa.by") && !re.is_match("xaXby"));
+/// # Ok::<(), rusty_regx::Error>(())
+/// ```
 pub fn escape(text: &str) -> std::borrow::Cow<'_, str> {
     let is_meta = |c: char| {
         matches!(

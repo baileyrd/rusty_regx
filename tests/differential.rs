@@ -213,12 +213,26 @@ fn differential_against_regex_crate() {
                     .map(|i| caps.get(i).map(|m| m.as_str().to_owned()))
                     .collect()
             });
+            // Boolean agreement is immune to the crate's prefilter
+            // artifact, so it holds unconditionally.
+            assert_eq!(
+                ours.is_match(&text),
+                theirs.is_match(&text),
+                "case {case}: is_match divergence on pattern {pattern:?}, text {text:?}"
+            );
             if a != b && crate_skipped_earlier_match(&pattern, &ours, &theirs, &text) {
                 continue;
             }
             assert_eq!(
                 a, b,
                 "case {case}: divergence on pattern {pattern:?}, text {text:?} (ours = left)"
+            );
+            // With captures agreeing, find's span must agree too — this is
+            // the external oracle for the group-0-only fast path.
+            assert_eq!(
+                ours.find(&text).map(|m| (m.start(), m.end())),
+                theirs.find(&text).map(|m| (m.start(), m.end())),
+                "case {case}: find divergence on pattern {pattern:?}, text {text:?}"
             );
         }
     }
@@ -370,6 +384,11 @@ fn differential_ci_against_regex_crate() {
                     .map(|i| caps.get(i).map(|m| m.as_str().to_owned()))
                     .collect()
             });
+            assert_eq!(
+                ours.is_match(&text),
+                theirs.is_match(&text),
+                "case {case}: ci is_match divergence on pattern {pattern:?}, text {text:?}"
+            );
             if a != b
                 && crate_skipped_earlier_match_wrapped(&pattern, &wrapped, &ours, &theirs, &text)
             {
@@ -378,6 +397,11 @@ fn differential_ci_against_regex_crate() {
             assert_eq!(
                 a, b,
                 "case {case}: ci divergence on pattern {pattern:?}, text {text:?} (ours = left)"
+            );
+            assert_eq!(
+                ours.find(&text).map(|m| (m.start(), m.end())),
+                theirs.find(&text).map(|m| (m.start(), m.end())),
+                "case {case}: ci find divergence on pattern {pattern:?}, text {text:?}"
             );
         }
     }
