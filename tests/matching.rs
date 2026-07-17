@@ -438,6 +438,42 @@ fn literal_fast_path_matches_vm_semantics() {
     );
 }
 
+/// Group-free exactly-literal patterns (incl. exact repetitions and the
+/// empty pattern) take the substring path; group-bearing ones must not.
+#[test]
+fn literal_fast_path_generalizations() {
+    assert_eq!(find("a{3}", "xxaaay"), Some("aaa"));
+    assert_eq!(find("ab{2}c", "zabbcz"), Some("abbc"));
+    assert_eq!(find("^a{2}$", "aa"), Some("aa"));
+    assert_eq!(find("^a{2}$", "aaa"), None);
+    assert_eq!(find("", "xy"), Some(""));
+    assert_eq!(find("", ""), Some(""));
+    // A group forces real capture tracking — group 1 must still report.
+    assert_eq!(
+        groups("(a){3}", "aaa"),
+        Some(vec![Some("aaa".into()), Some("a".into())])
+    );
+}
+
+/// The mandatory-suffix quick reject must never veto a real match.
+#[test]
+fn suffix_quick_reject_preserves_semantics() {
+    // Rejects (no "@x.com" anywhere / at end) and accepts.
+    assert_eq!(find("[a-z]+@x\\.com", "aaa bbb ccc"), None);
+    assert_eq!(find("[a-z]+@x\\.com", "hi bob@x.com!"), Some("bob@x.com"));
+    assert_eq!(find("[a-z]+@x\\.com$", "bob@x.com later"), None);
+    assert_eq!(find("[a-z]+@x\\.com$", "mail bob@x.com"), Some("bob@x.com"));
+    // Suffix through groups, exact repetitions, and alternation LCS.
+    assert_eq!(find("[0-9]+(ab){2}", "7abab"), Some("7abab"));
+    assert_eq!(find("[0-9]+(xa|ya)", "3ya"), Some("3ya"));
+    assert_eq!(find("[0-9]+(xa|ya)", "3yb"), None);
+    // Open-ended repetition tails contribute their body once.
+    assert_eq!(find(".b{2,}", "xbbb"), Some("xbbb"));
+    // POSIX mode takes the same quick reject.
+    assert_eq!(find_posix("[a-z]+@x\\.com", "aaa bbb"), None);
+    assert_eq!(find_posix("[0-9]+(ab){2}", "7abab"), Some("7abab"));
+}
+
 /// Multi-char mandatory prefixes accelerate the scan; these pin the
 /// cases where prefix extraction could overreach.
 #[test]

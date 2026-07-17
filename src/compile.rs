@@ -135,6 +135,14 @@ pub struct Program {
     /// at either end): the VM bypasses NFA simulation entirely and
     /// matches by substring search. Never set in `icase` mode.
     pub literal: Option<Literal>,
+    /// The literal string every match must end with (empty if none):
+    /// a no-match rejects with one substring scan before any VM work.
+    /// Empty in `icase` mode.
+    pub suffix: String,
+    /// Whether every match must end at the input's end (`$` on every
+    /// branch) — upgrades the suffix check from `contains` to
+    /// `ends_with`.
+    pub suffix_anchored: bool,
 }
 
 /// A pattern that is a plain literal, matched by substring search.
@@ -203,7 +211,19 @@ pub fn compile(mut ast: Ast, icase: bool) -> Result<Program, Error> {
     if !anchored && !icase {
         collect_prefix(&ast, &mut prefix);
     }
-    let literal = if icase { None } else { literal_of(&ast) };
+    let mut suffix = String::new();
+    if !icase {
+        collect_suffix_rev(&ast, &mut suffix);
+        suffix = suffix.chars().rev().collect();
+    }
+    let suffix_anchored = ends_anchored(&ast);
+    // Groups need real capture tracking; the substring path reports only
+    // group 0.
+    let literal = if icase || group_count > 1 {
+        None
+    } else {
+        literal_of(&ast)
+    };
     Ok(Program {
         insts: c.insts,
         classes: c.classes,
@@ -213,6 +233,8 @@ pub fn compile(mut ast: Ast, icase: bool) -> Result<Program, Error> {
         icase,
         prefix,
         literal,
+        suffix,
+        suffix_anchored,
     })
 }
 
@@ -240,10 +262,12 @@ fn literal_of(ast: &Ast) -> Option<Literal> {
         lit.anchored_end = true;
         items = &items[..items.len() - 1];
     }
+    // Every remaining item must be *exactly* its literal — Chars, exact
+    // repetitions of literals, Empty (the caller has already excluded
+    // patterns with groups).
     for item in items {
-        match item {
-            Ast::Char(c) => lit.s.push(*c),
-            _ => return None,
+        if !collect_prefix(item, &mut lit.s) {
+            return None;
         }
     }
     Some(lit)
@@ -269,6 +293,7 @@ fn starts_anchored(ast: &Ast) -> bool {
 /// past it). Conservative: anything uncertain ends the prefix.
 fn collect_prefix(ast: &Ast, out: &mut String) -> bool {
     match ast {
+        Ast::Empty => true,
         Ast::Char(c) => {
             out.push(*c);
             true
@@ -298,6 +323,65 @@ fn collect_prefix(ast: &Ast, out: &mut String) -> bool {
             });
             let mut common = prefixes.next().unwrap_or_default();
             for p in prefixes {
+                let shared = common
+                    .chars()
+                    .zip(p.chars())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| a.len_utf8())
+                    .sum();
+                common.truncate(shared);
+            }
+            out.push_str(&common);
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Whether every match of `ast` must end at the input's end — the mirror
+/// of `starts_anchored`.
+fn ends_anchored(ast: &Ast) -> bool {
+    match ast {
+        Ast::EndAnchor => true,
+        Ast::Concat(items) => items.last().is_some_and(ends_anchored),
+        Ast::Alternation(branches) => branches.iter().all(ends_anchored),
+        Ast::Group(_, inner) => ends_anchored(inner),
+        Ast::Repeat { ast, min, .. } => *min >= 1 && ends_anchored(ast),
+        _ => false,
+    }
+}
+
+/// The mirror of `collect_prefix`: accumulates the mandatory literal
+/// suffix in *reverse char order* into `out` (the caller un-reverses).
+/// Returns whether the construct is exactly its literal.
+fn collect_suffix_rev(ast: &Ast, out: &mut String) -> bool {
+    match ast {
+        Ast::Empty => true,
+        Ast::Char(c) => {
+            out.push(*c);
+            true
+        }
+        Ast::Concat(items) => items.iter().rev().all(|item| collect_suffix_rev(item, out)),
+        Ast::Group(_, inner) => collect_suffix_rev(inner, out),
+        Ast::Repeat { ast, min, max, .. } if *min >= 1 => {
+            let start = out.len();
+            if !collect_suffix_rev(ast, out) {
+                return false;
+            }
+            let body = out[start..].to_string();
+            for _ in 1..*min {
+                out.push_str(&body);
+            }
+            *max == Some(*min)
+        }
+        Ast::Alternation(branches) => {
+            let mut suffixes = branches.iter().map(|b| {
+                let mut p = String::new();
+                collect_suffix_rev(b, &mut p);
+                p
+            });
+            let mut common = suffixes.next().unwrap_or_default();
+            for p in suffixes {
                 let shared = common
                     .chars()
                     .zip(p.chars())

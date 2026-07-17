@@ -47,6 +47,21 @@ fn literal_span(lit: &Literal, text: &str) -> Option<(usize, usize)> {
     }
 }
 
+/// The mandatory-suffix quick reject: every match must end with
+/// `program.suffix`, so text that doesn't contain it (or doesn't end
+/// with it, for `\$`-anchored patterns) can't match — one substring
+/// scan instead of a full NFA simulation.
+fn suffix_rejects(program: &Program, text: &str) -> bool {
+    if program.suffix.is_empty() {
+        return false;
+    }
+    if program.suffix_anchored {
+        !text.ends_with(&program.suffix)
+    } else {
+        !text.contains(&program.suffix)
+    }
+}
+
 /// One thread's outcome stepping over the current input char — the single
 /// point of truth for consuming-instruction dispatch, shared by all three
 /// execution modes (`c` is the raw char, `fc` the case-folded one).
@@ -104,6 +119,9 @@ pub fn exec(
     if let Some(lit) = &program.literal {
         // A literal pattern has no groups: group 0 is the only capture.
         return literal_span(lit, text).map(|span| vec![Some(span)]);
+    }
+    if suffix_rejects(program, text) {
+        return None;
     }
     let len = text.len();
     let mut clist: Vec<(usize, Slots)> = Vec::new();
@@ -280,6 +298,9 @@ pub fn exec_bool(program: &Program, text: &str) -> bool {
     if let Some(lit) = &program.literal {
         return literal_span(lit, text).is_some();
     }
+    if suffix_rejects(program, text) {
+        return false;
+    }
     let len = text.len();
     let mut clist: Vec<usize> = Vec::new();
     let mut nlist: Vec<usize> = Vec::new();
@@ -409,6 +430,9 @@ pub fn exec_posix(
     if let Some(lit) = &program.literal {
         // Fixed-length literal: leftmost-first and leftmost-longest agree.
         return literal_span(lit, text).map(|span| vec![Some(span)]);
+    }
+    if suffix_rejects(program, text) {
+        return None;
     }
     let len = text.len();
     let mut st = PosixStep {
