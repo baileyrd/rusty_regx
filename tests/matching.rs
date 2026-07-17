@@ -670,6 +670,26 @@ fn newline_mode() {
     );
 }
 
+/// debug_dump's format is unstable, but its load-bearing facts —
+/// which tier ran, what was extracted — should stay visible.
+#[test]
+fn debug_dump_shows_strategy() {
+    let dump = Regex::new("abc").unwrap().debug_dump();
+    assert!(dump.contains("literal substring path"), "{dump}");
+    let dump = Regex::new("release-[0-9]+").unwrap().debug_dump();
+    assert!(dump.contains("scan prefix: \"release-\""), "{dump}");
+    assert!(dump.contains("pike-vm"), "{dump}");
+    assert!(dump.contains("Match"), "{dump}");
+    let dump = Regex::builder()
+        .posix(true)
+        .newline(true)
+        .build("x[0-9]$")
+        .unwrap()
+        .debug_dump();
+    assert!(dump.contains("posix"), "{dump}");
+    assert!(dump.contains("+ newline"), "{dump}");
+}
+
 #[test]
 fn repetition_size_limits() {
     assert_eq!(

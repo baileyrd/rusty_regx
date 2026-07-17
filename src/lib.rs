@@ -156,6 +156,60 @@ impl Regex {
         &self.pattern
     }
 
+    /// A human-readable rendering of how this pattern was compiled: the
+    /// mode, the chosen execution strategy (literal substring path,
+    /// extracted scan prefix / suffix, or the Pike VM), and the
+    /// instruction listing. Intended for debugging "why doesn't this
+    /// match?".
+    ///
+    /// The output format is **unstable** — it is not part of the semver
+    /// contract and may change in any release.
+    pub fn debug_dump(&self) -> String {
+        use std::fmt::Write;
+        let p = &self.program;
+        let mut out = String::new();
+        let _ = writeln!(out, "pattern: {:?}", self.pattern);
+        let _ = writeln!(
+            out,
+            "mode: {}{}{}",
+            if self.posix {
+                "posix (leftmost-longest)"
+            } else {
+                "leftmost-first"
+            },
+            if p.icase { " + case-insensitive" } else { "" },
+            if p.newline { " + newline" } else { "" },
+        );
+        if let Some(lit) = &p.literal {
+            let _ = writeln!(
+                out,
+                "tier: literal substring path {:?} (anchored start: {}, end: {})",
+                lit.s, lit.anchored_start, lit.anchored_end,
+            );
+            return out;
+        }
+        if !p.prefix.is_empty() {
+            let _ = writeln!(out, "scan prefix: {:?}", p.prefix);
+        }
+        if !p.suffix.is_empty() {
+            let _ = writeln!(
+                out,
+                "required suffix: {:?} (anchored: {})",
+                p.suffix, p.suffix_anchored,
+            );
+        }
+        let _ = writeln!(
+            out,
+            "tier: pike-vm ({} instructions, {} groups)",
+            p.insts.len(),
+            p.group_count,
+        );
+        for (i, inst) in p.insts.iter().enumerate() {
+            let _ = writeln!(out, "{i:5}: {inst:?}");
+        }
+        out
+    }
+
     /// Whether `text` contains a match, without computing capture groups.
     ///
     /// Equivalent to `self.captures(text).is_some()` but faster: the VM
