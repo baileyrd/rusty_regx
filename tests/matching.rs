@@ -414,6 +414,24 @@ fn find_iter_agrees_with_regex_crate() {
     }
 }
 
+/// `Match` derives `PartialEq`/`Eq`/`Hash` (matching the `regex` crate's
+/// ergonomics): callers can dedupe matches in a `HashSet` or compare spans
+/// directly instead of manually comparing `.range()`.
+#[test]
+fn match_is_comparable_and_hashable() {
+    use std::collections::HashSet;
+    let re = Regex::new("a+").unwrap();
+    let text = "aa b aaa";
+    let m1 = re.find(text).unwrap();
+    let m2 = re.find(text).unwrap();
+    assert_eq!(m1, m2); // same source text, same span
+    let other = re.find_iter(text).nth(1).unwrap();
+    assert_ne!(m1, other); // different span
+    let set: HashSet<_> = re.find_iter(text).collect();
+    assert_eq!(set.len(), 2);
+    assert!(set.contains(&m1));
+}
+
 #[test]
 fn iteration_semantics() {
     // Anchors keep absolute meaning across restarts: ^ matches only the
@@ -497,7 +515,9 @@ fn literal_fast_path_matches_vm_semantics() {
         );
         assert_eq!(first.is_match(t), first.captures(t).is_some(), "{p} on {t}");
     }
-    // icase literals do NOT take the fast path (folding): still correct.
+    // ASCII icase literals take the fast path (byte-level ASCII-case-
+    // insensitive substring search); non-ASCII ones still fall back to the
+    // VM (Unicode folding isn't byte-length-preserving). Both must agree.
     assert_eq!(
         Regex::new_ci("abc")
             .unwrap()
@@ -506,6 +526,41 @@ fn literal_fast_path_matches_vm_semantics() {
             .get(0),
         Some("ABC")
     );
+    assert!(Regex::new_ci("abc")
+        .unwrap()
+        .debug_dump()
+        .contains("literal"));
+    assert_eq!(
+        Regex::new_ci("éx")
+            .unwrap()
+            .captures("zÉXy")
+            .unwrap()
+            .get(0),
+        Some("ÉX")
+    );
+    assert!(!Regex::new_ci("éx")
+        .unwrap()
+        .debug_dump()
+        .contains("literal"));
+}
+
+/// The icase literal fast path is ASCII-only (byte-level case folding);
+/// these pin its correctness across anchors and its fallback for non-ASCII
+/// literals, which must still match correctly via the VM.
+#[test]
+fn icase_literal_fast_path_is_ascii_only() {
+    assert_eq!(find_ci("bcd", "aBCDbcd"), Some("BCD"));
+    assert_eq!(find_ci("^ab", "ABab"), Some("AB"));
+    assert_eq!(find_ci("ab$", "ABab"), Some("ab"));
+    assert_eq!(find_ci("^ab$", "AB"), Some("AB"));
+    assert_eq!(find_ci("^ab$", "abAB"), None);
+    // A no-match must still terminate via the fast path, not the VM.
+    assert_eq!(find_ci("zz", "aBCDbcd"), None);
+    // Multibyte (non-ASCII) chars anywhere in the literal disqualify the
+    // fast path for the *whole* literal, not just that char, but matching
+    // stays correct via the VM.
+    assert_eq!(find_ci("aéc", "xAÉCy"), Some("AÉC"));
+    assert_eq!(find_ci("aéc", "xaecy"), None);
 }
 
 /// Group-free exactly-literal patterns (incl. exact repetitions and the
@@ -670,6 +725,38 @@ fn newline_mode() {
     );
 }
 
+/// `` \` `` / `\'` (GNU absolute buffer anchors) always mean true start/end
+/// of input, unlike `^`/`$`, which under `REG_NEWLINE` also match around
+/// embedded newlines. This used to be conflated with `^`/`$` (both parsed
+/// to the same AST node) so `` \`b `` incorrectly matched at line starts
+/// under the mode, exactly the combination glibc introduced these escapes
+/// to avoid.
+#[test]
+fn buffer_anchors_are_immune_to_newline_mode() {
+    let b = || Regex::builder().newline(true);
+    // `^`/`$` match at line boundaries under the mode...
+    assert!(b().build("^b").unwrap().is_match("a\nb"));
+    assert!(b().build("a$").unwrap().is_match("a\nb"));
+    // ...but `` \` ``/`\'` never do, mode or not.
+    assert!(!b().build(r"\`b").unwrap().is_match("a\nb"));
+    assert!(!b().build(r"a\'").unwrap().is_match("a\nb"));
+    assert!(!Regex::new(r"\`b").unwrap().is_match("a\nb"));
+    assert!(!Regex::new(r"a\'").unwrap().is_match("a\nb"));
+    // They still match the true edges, mode or not.
+    assert!(b().build(r"\`a").unwrap().is_match("a\nb"));
+    assert!(b().build(r"b\'").unwrap().is_match("a\nb"));
+    // The anchored/literal fast paths must agree: `` \` `` still enables
+    // the anchored-at-0 fast path even under the mode (unlike `^`), and a
+    // pure-literal `` \`lit `` pattern's substring path stays valid too.
+    let re = b().build(r"\`abc").unwrap();
+    assert!(re.debug_dump().contains("anchored"));
+    assert!(re.is_match("abc"));
+    assert!(!re.is_match("x\nabc"));
+    let re = b().build(r"abc\'").unwrap();
+    assert!(re.is_match("abc"));
+    assert!(!re.is_match("abc\nx"));
+}
+
 /// debug_dump's format is unstable, but its load-bearing facts —
 /// which tier ran, what was extracted — should stay visible.
 #[test]
@@ -752,15 +839,22 @@ fn scan_hints_preserve_semantics() {
 
 #[test]
 fn repetition_size_limits() {
-    assert_eq!(
-        Regex::new("a{1001}").unwrap_err().kind(),
-        ErrorKind::RepetitionTooLarge
-    );
-    // Within the per-interval cap but past the program-size cap.
-    assert_eq!(
-        Regex::new("(a{1000}){1000}").unwrap_err().kind(),
-        ErrorKind::RepetitionTooLarge
-    );
+    // A single interval past the cap is a syntactic condition — the `{`'s
+    // position is known and reported (unlike the aggregate case below).
+    let e = Regex::new("a{1001}").unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::RepetitionTooLarge);
+    assert_eq!(e.position(), Some(1));
+    let e = Regex::new("ab{3,1001}").unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::RepetitionTooLarge);
+    assert_eq!(e.position(), Some(2));
+    let e = Regex::new("a{1001,}").unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::RepetitionTooLarge);
+    assert_eq!(e.position(), Some(1));
+    // Within the per-interval cap but past the program-size cap: an
+    // aggregate condition with no single position to blame.
+    let e = Regex::new("(a{1000}){1000}").unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::RepetitionTooLarge);
+    assert_eq!(e.position(), None);
     assert!(Regex::new("a{1000}").is_ok());
 }
 
@@ -881,6 +975,39 @@ fn icase_prefix_acceleration_preserves_semantics() {
             .unwrap()
             .get(0),
         Some("ςx")
+    );
+}
+
+/// The suffix quick-reject used to be disabled entirely in `icase` mode
+/// (only the prefix side was fold-aware); a mandatory-tail pattern like
+/// `foo[0-9]+bar$` against a long non-matching haystack fell back to full
+/// NFA simulation instead of the one-scan reject non-icase patterns get.
+/// These pin the fold-aware `contains`/`ends_with` comparisons.
+#[test]
+fn icase_suffix_quick_reject_preserves_semantics() {
+    let long = "no match here, ".repeat(500);
+    // Rejects: the folded suffix never occurs.
+    assert!(!Regex::new_ci("[a-z]+@X\\.COM").unwrap().is_match(&long));
+    assert!(!Regex::new_ci("[a-z]+@X\\.COM$")
+        .unwrap()
+        .is_match(&format!("{long}bob@x.com later")));
+    // Accepts, folding either direction.
+    assert_eq!(
+        find_ci("[a-z]+@X\\.COM", &format!("{long}hi BOB@x.COM!")),
+        Some("BOB@x.COM")
+    );
+    assert_eq!(
+        find_ci("[a-z]+@X\\.COM$", &format!("{long}mail bob@X.com")),
+        Some("bob@X.com")
+    );
+    // Sigma folds at the tail too.
+    assert_eq!(
+        Regex::new_ci("x[σΣ]")
+            .unwrap()
+            .captures(&format!("{long}xς"))
+            .unwrap()
+            .get(0),
+        Some("xς")
     );
 }
 

@@ -33,12 +33,47 @@ use std::rc::Rc;
 /// `Send + Sync`.
 type Slots = Rc<Vec<Option<usize>>>;
 
+/// ASCII case-insensitive substring search: used only for icase literal
+/// patterns, which are restricted to ASCII text (see [`Program::literal`]),
+/// so this can stay a plain byte scan. Safe over raw bytes even though
+/// `text` may hold multi-byte UTF-8 elsewhere: a continuation/lead byte
+/// (>= 0x80) never equals an ASCII needle byte under `eq_ignore_ascii_case`
+/// (it only case-flips `A-Za-z`, and falls back to plain equality
+/// otherwise), so a byte match can never straddle a char boundary.
+fn ascii_find_ignore_case(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if hay.len() < needle.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| hay[i..i + needle.len()].eq_ignore_ascii_case(needle))
+}
+
 /// The substring fast path for pure-literal patterns (see
 /// [`Program::literal`]): the leftmost match's byte span, or `None`.
 /// Leftmost-first and POSIX agree here — a literal has exactly one
 /// possible span per start position.
 fn literal_span(lit: &Literal, text: &str, from: usize) -> Option<(usize, usize)> {
     let n = lit.s.len();
+    if lit.icase {
+        let (t, s) = (text.as_bytes(), lit.s.as_bytes());
+        return match (lit.anchored_start, lit.anchored_end) {
+            (true, true) => {
+                (from == 0 && t.len() == n && t.eq_ignore_ascii_case(s)).then_some((0, n))
+            }
+            (true, false) => {
+                (from == 0 && t.len() >= n && t[..n].eq_ignore_ascii_case(s)).then_some((0, n))
+            }
+            (false, true) => {
+                (t.len() >= n && t.len() - n >= from && t[t.len() - n..].eq_ignore_ascii_case(s))
+                    .then(|| (t.len() - n, t.len()))
+            }
+            (false, false) => {
+                ascii_find_ignore_case(&t[from..], s).map(|i| (from + i, from + i + n))
+            }
+        };
+    }
     match (lit.anchored_start, lit.anchored_end) {
         // `^`-anchored: only reachable when the search starts at 0.
         (true, true) => (from == 0 && text == lit.s).then_some((0, n)),
@@ -123,19 +158,46 @@ fn find_scan_hint(program: &Program, hay: &str) -> Option<usize> {
     None
 }
 
+/// Whether `hay`, case-folded char by char, begins with pre-folded `needle`.
+fn starts_with_folded(hay: &str, needle: &str) -> bool {
+    let mut h = hay.chars();
+    needle
+        .chars()
+        .all(|nc| h.next().is_some_and(|hc| fold(hc) == nc))
+}
+
+/// Whether `hay`, case-folded, ends with pre-folded `needle`.
+fn ends_with_folded(hay: &str, needle: &str) -> bool {
+    let mut h = hay.chars().rev();
+    needle
+        .chars()
+        .rev()
+        .all(|nc| h.next().is_some_and(|hc| fold(hc) == nc))
+}
+
+/// Whether `hay`, case-folded, contains pre-folded `needle` anywhere.
+fn contains_folded(hay: &str, needle: &str) -> bool {
+    needle.is_empty()
+        || hay
+            .char_indices()
+            .any(|(i, _)| starts_with_folded(&hay[i..], needle))
+}
+
 /// The mandatory-suffix quick reject: every match must end with
 /// `program.suffix`, so text that doesn't contain it (or doesn't end
 /// with it, for `\$`-anchored patterns) can't match — one substring
-/// scan instead of a full NFA simulation.
+/// scan instead of a full NFA simulation. In `icase` mode `program.suffix`
+/// is pre-folded, so the comparison folds the haystack too.
 fn suffix_rejects(program: &Program, text: &str, from: usize) -> bool {
     if program.suffix.is_empty() {
         return false;
     }
     // The suffix must lie within the searched region [from..].
-    if program.suffix_anchored {
-        !text[from..].ends_with(&program.suffix)
-    } else {
-        !text[from..].contains(&program.suffix)
+    match (program.suffix_anchored, program.icase) {
+        (true, false) => !text[from..].ends_with(&program.suffix),
+        (false, false) => !text[from..].contains(&program.suffix),
+        (true, true) => !ends_with_folded(&text[from..], &program.suffix),
+        (false, true) => !contains_folded(&text[from..], &program.suffix),
     }
 }
 
@@ -165,6 +227,8 @@ fn step(program: &Program, pc: usize, c: Option<char>, fc: Option<char>) -> Step
         | Inst::Save(_)
         | Inst::StartAnchor
         | Inst::EndAnchor
+        | Inst::BufferStart
+        | Inst::BufferEnd
         | Inst::WordBoundary
         | Inst::NotWordBoundary
         | Inst::WordStart
@@ -405,6 +469,16 @@ fn add_thread(
                     stack.push((pc + 1, slots));
                 }
             }
+            Inst::BufferStart => {
+                if pos == 0 {
+                    stack.push((pc + 1, slots));
+                }
+            }
+            Inst::BufferEnd => {
+                if pos == len {
+                    stack.push((pc + 1, slots));
+                }
+            }
             Inst::WordBoundary => {
                 if is_word(prev) != is_word(next) {
                     stack.push((pc + 1, slots));
@@ -563,6 +637,16 @@ fn add_thread_bool(
             }
             Inst::EndAnchor => {
                 if pos == len || (program.newline && next == Some('\n')) {
+                    stack.push(pc + 1);
+                }
+            }
+            Inst::BufferStart => {
+                if pos == 0 {
+                    stack.push(pc + 1);
+                }
+            }
+            Inst::BufferEnd => {
+                if pos == len {
                     stack.push(pc + 1);
                 }
             }
@@ -791,6 +875,16 @@ fn closure_posix(
             }
             Inst::EndAnchor => {
                 if pos == len || (program.newline && next == Some('\n')) {
+                    stack.push((pc + 1, slots));
+                }
+            }
+            Inst::BufferStart => {
+                if pos == 0 {
+                    stack.push((pc + 1, slots));
+                }
+            }
+            Inst::BufferEnd => {
+                if pos == len {
                     stack.push((pc + 1, slots));
                 }
             }

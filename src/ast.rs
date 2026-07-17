@@ -15,6 +15,12 @@ pub enum Ast {
     StartAnchor,
     /// `$`.
     EndAnchor,
+    /// `` \` `` — GNU absolute start-of-buffer: unlike `^`, always means
+    /// true position 0, immune to `REG_NEWLINE`.
+    BufferStart,
+    /// `\'` — GNU absolute end-of-buffer: unlike `$`, always means the true
+    /// end of input, immune to `REG_NEWLINE`.
+    BufferEnd,
     /// `\b` — GNU word boundary (exactly one side is a word char).
     WordBoundary,
     /// `\B` — GNU non-boundary (both sides word, or neither).

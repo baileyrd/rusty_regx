@@ -27,8 +27,11 @@ impl Error {
     /// unclosed `[`, the `{` of a malformed interval).
     ///
     /// `None` for errors detected after parsing, where no single pattern
-    /// position applies (e.g. a repetition that exceeds the program-size
-    /// cap, or a range that only becomes invalid after case folding).
+    /// position applies (e.g. nested repetitions whose *combined* expansion
+    /// exceeds the program-size cap — `(a{1000}){1000}` — where no single
+    /// `{...}` is at fault; or a range that only becomes invalid after case
+    /// folding). A single interval whose own written bound is too large
+    /// (`a{1001}`) is a syntactic condition and does carry a position.
     pub fn position(&self) -> Option<usize> {
         self.pos
     }
@@ -52,7 +55,8 @@ pub enum ErrorKind {
     DanglingQuantifier,
     /// The pattern ends in a lone `\`.
     TrailingBackslash,
-    /// Groups are nested deeper than the parser's depth cap.
+    /// Groups and/or stacked quantifiers are nested deeper than the
+    /// parser's depth cap.
     NestingTooDeep,
     /// An interval expansion exceeds the program-size cap.
     RepetitionTooLarge,
@@ -70,7 +74,7 @@ impl fmt::Display for Error {
                 "quantifier is not preceded by a repeatable expression"
             }
             ErrorKind::TrailingBackslash => "pattern ends with a trailing backslash",
-            ErrorKind::NestingTooDeep => "groups are nested too deeply",
+            ErrorKind::NestingTooDeep => "expression is nested too deeply",
             ErrorKind::RepetitionTooLarge => "repetition interval is too large",
         };
         match self.pos {
