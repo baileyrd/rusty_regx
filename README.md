@@ -54,7 +54,8 @@ if let Some(caps) = re.captures("release-2026") {
 
 Matching is an unanchored search (like bash `=~`). When only match/no-match
 is needed, `is_match` skips capture tracking entirely and is faster than
-`captures`. `Regex::new` uses
+`captures`; `find` returns just the match location, tracking group 0
+alone. `Regex::new` uses
 leftmost-first semantics, identical to the `regex` crate. `Regex::new_posix`
 opts into POSIX leftmost-longest semantics — what real bash/glibc report:
 

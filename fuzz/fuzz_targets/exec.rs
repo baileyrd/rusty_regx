@@ -59,7 +59,6 @@ fn span0(re: &Regex, text: &str) -> Option<(usize, usize)> {
         caps.is_some(),
         "is_match disagrees with captures"
     );
-    let caps = caps;
     assert_eq!(
         re.find(text).map(|m| (m.start(), m.end())),
         caps.as_ref().and_then(|c| c.span(0)),
