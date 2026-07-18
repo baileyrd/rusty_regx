@@ -43,7 +43,7 @@ impl<'t> Captures<'t> {
     pub fn len(&self) -> usize;
     pub fn get(&self, i: usize) -> Option<&'t str>;
 }
-pub fn escape(text: &str) -> String;  // escapes exactly THIS engine's metachars
+pub fn escape(text: &str) -> Cow<'_, str>;  // escapes exactly THIS engine's metachars
 ```
 
 ## Architecture

@@ -40,6 +40,26 @@ All notable changes to this crate are documented here. The format follows
   now take the substring fast path instead of always running the full VM;
   non-ASCII icase literals still fall back to the VM (Unicode case folding
   isn't byte-length-preserving).
+- `Regex::new_posix`'s class-headed patterns (`[0-9]+`, `\w+`, ... — no
+  literal prefix, only a mandatory head *class*) now get the scan-hint
+  fast-forward too: `exec_posix` checked only `Program::prefix` before
+  skipping ahead, so these patterns silently fell back to unaccelerated
+  per-char stepping under POSIX mode (~150x slower than the identical
+  leftmost-first program on a 2MB no-match in local measurements) even
+  though `Regex::new`/`is_match` on the same pattern were already fast.
+- `Regex::clone()` is now O(1): the compiled program is held behind an
+  `Arc` instead of being deep-copied on every clone, matching the
+  `regex` crate's cheap-clone-and-share ergonomics.
+- Repeated occurrences of the same bracket expression — a fixed-count
+  interval body (`[0-9]{100}`), a class shared across alternation
+  branches, or the class-head scan hint duplicating a class also used in
+  the program body — now intern to one shared `CompiledClass` at compile
+  time instead of a fresh copy (and a fresh 128-entry ASCII bitmap
+  computation) per occurrence.
+- The icase literal substring scan (`Regex::new_ci("literal")`'s fast
+  path) now skips non-candidate positions by first-byte comparison before
+  paying for a full `eq_ignore_ascii_case` call, the same technique the
+  icase prefix scan already used.
 
 ### Fixed
 
@@ -54,6 +74,15 @@ All notable changes to this crate are documented here. The format follows
 - `` \` ``/`\'` (GNU absolute buffer anchors) were parsed identically to
   `^`/`$`, so under `REG_NEWLINE` mode they incorrectly matched at every
   line boundary instead of only the true start/end of the whole input.
+- Under `REG_NEWLINE`, the class-head scan hint for a negated class
+  (`[^a]+`) didn't exclude `\n`, unlike the compiled instruction it's a
+  hint for — the VM still rejected `\n` there (so this never caused a
+  wrong match), but the hint could offer it as a scan candidate,
+  degrading the fast-forward for line-mode patterns headed by a negated
+  class.
+- `debug_dump()` didn't report the class-head scan hint at all — a
+  class-headed pattern like `[0-9]+x` looked, from the dump alone, like
+  it fell all the way through to the unaccelerated Pike VM.
 
 ## [0.4.0] — 2026-07-17
 

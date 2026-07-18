@@ -40,6 +40,13 @@ type Slots = Rc<Vec<Option<usize>>>;
 /// (>= 0x80) never equals an ASCII needle byte under `eq_ignore_ascii_case`
 /// (it only case-flips `A-Za-z`, and falls back to plain equality
 /// otherwise), so a byte match can never straddle a char boundary.
+///
+/// Skips straight to candidates whose first byte matches (either case)
+/// before paying for the full-needle comparison — the same trick
+/// `find_prefix` already uses for the icase prefix scan. Still `O(n·m)`
+/// worst case (no Two-Way/Boyer-Moore here), but avoids the per-position
+/// `eq_ignore_ascii_case` call for the common case where the first byte
+/// alone rules a position out.
 fn ascii_find_ignore_case(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
@@ -47,7 +54,13 @@ fn ascii_find_ignore_case(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if hay.len() < needle.len() {
         return None;
     }
-    (0..=hay.len() - needle.len()).find(|&i| hay[i..i + needle.len()].eq_ignore_ascii_case(needle))
+    let (lo, hi) = (
+        needle[0].to_ascii_lowercase(),
+        needle[0].to_ascii_uppercase(),
+    );
+    (0..=hay.len() - needle.len())
+        .filter(|&i| hay[i] == lo || hay[i] == hi)
+        .find(|&i| hay[i..i + needle.len()].eq_ignore_ascii_case(needle))
 }
 
 /// The substring fast path for pure-literal patterns (see
@@ -726,8 +739,13 @@ pub fn exec_posix(
 
     let mut pos = from;
     loop {
-        if !program.prefix.is_empty() && best_match.is_none() && at_restart(clist, &restart, pos) {
-            match find_prefix(program, &text[pos..]) {
+        // See the fast-forward note in `exec`: this must cover the same
+        // hints (literal prefix *or* mandatory head class) `exec`/`exec_bool`
+        // do. It previously checked `prefix` alone, so POSIX-mode
+        // class-headed patterns (`Regex::new_posix("[0-9]+")`) never got the
+        // fast-forward and fell back to unaccelerated per-char stepping.
+        if has_scan_hint(program) && best_match.is_none() && at_restart(clist, &restart, pos) {
+            match find_scan_hint(program, &text[pos..]) {
                 Some(0) => {}
                 Some(off) => {
                     pos += off;

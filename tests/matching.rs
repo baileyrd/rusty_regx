@@ -835,6 +835,79 @@ fn scan_hints_preserve_semantics() {
     // \bword\b now reports a scan prefix in the dump.
     let dump = Regex::new(r"\bword\b").unwrap().debug_dump();
     assert!(dump.contains("scan prefix: \"word\""), "{dump}");
+    // The class-head hint itself now shows up in the dump (previously
+    // silently omitted, unlike the prefix/suffix hints).
+    let dump = Regex::new("[0-9]+x").unwrap().debug_dump();
+    assert!(dump.contains("scan hint: mandatory head class"), "{dump}");
+}
+
+/// `exec_posix` previously checked only `Program::prefix` before
+/// fast-forwarding, so class-headed patterns like `[0-9]+` (no literal
+/// prefix, only a mandatory head *class*) never got the scan-hint
+/// fast-forward under `Regex::new_posix` — silently falling back to
+/// unaccelerated per-char stepping. Both modes share one `Program`
+/// (`posix` only selects the VM entry point), so leftmost-first and POSIX
+/// must take the same amount of work, not just agree on the answer; a
+/// generous wall-clock cap (not a tight one, to stay non-flaky on shared
+/// CI runners) catches a regression back to the unaccelerated path, which
+/// was roughly 150x slower on this shape in local measurements.
+#[test]
+fn posix_mode_gets_the_class_head_scan_hint() {
+    let hay = "x".repeat(5_000_000);
+    let re = Regex::new_posix("[0-9]+").unwrap();
+    let start = std::time::Instant::now();
+    assert!(re.captures(&hay).is_none());
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "POSIX class-headed no-match took {:?} — the scan-hint fast-forward regressed",
+        start.elapsed()
+    );
+}
+
+/// Under `REG_NEWLINE`, a negated bracket expression excludes `\n` (see
+/// `newline_mode`) — and the class-head *scan hint* must exclude it too,
+/// or it offers the VM a candidate position it will reject, degrading
+/// (not breaking — the VM still validates) the fast-forward. Exercised
+/// through a long run of otherwise-matching text broken by a newline, so
+/// a hint that wrongly treats `\n` as a head-class member would still
+/// (slowly) reach the right answer — this pins the *result*, which is
+/// covered by other tests, together with using the same class instance
+/// as the head-class hint via interning (see `identical_classes_are_interned`).
+#[test]
+fn newline_mode_class_head_hint_excludes_newline() {
+    let re = Regex::builder().newline(true).build("[^a]+x").unwrap();
+    // "bb" is followed by '\n', not 'x' — REG_NEWLINE excludes '\n' from
+    // `[^a]`, so that run can't extend across it; the real match is "cc x".
+    assert_eq!(re.find("bb\ncc x").map(|m| m.as_str()), Some("cc x"));
+}
+
+/// Repeated occurrences of the same bracket expression (a fixed-count
+/// interval body, or the same class reused across alternation branches)
+/// now intern to one shared `CompiledClass` at compile time (see
+/// `Compiler::intern_class`) instead of a fresh copy per occurrence —
+/// this pins that the sharing is transparent to matching.
+#[test]
+fn identical_classes_are_interned() {
+    let re = Regex::new("[0-9]{6}").unwrap();
+    assert_eq!(re.find("id 123456!").map(|m| m.as_str()), Some("123456"));
+    assert!(!re.is_match("12345")); // too short: the interned class still gates length
+    let re = Regex::new("([0-9]x|[0-9]y)+").unwrap();
+    assert_eq!(re.find("_1x2y3x_").map(|m| m.as_str()), Some("1x2y3x"));
+}
+
+/// `Regex::clone()` shares the compiled program (`Arc`), not a deep copy —
+/// this pins that a clone matches identically and independently (dropping
+/// one doesn't affect the other) rather than testing the sharing itself,
+/// which isn't observable from the public API.
+#[test]
+fn clone_is_independent_and_correct() {
+    let re = Regex::new("([a-z]+)-([0-9]+)").unwrap();
+    let clone = re.clone();
+    drop(re);
+    let caps = clone.captures("build-42").unwrap();
+    assert_eq!(caps.get(0), Some("build-42"));
+    assert_eq!(caps.get(1), Some("build"));
+    assert_eq!(caps.get(2), Some("42"));
 }
 
 #[test]

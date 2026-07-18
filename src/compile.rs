@@ -241,6 +241,7 @@ pub fn compile(mut ast: Ast, icase: bool, newline: bool) -> Result<Program, Erro
     let mut c = Compiler {
         insts: Vec::new(),
         classes: Vec::new(),
+        class_index: std::collections::HashMap::new(),
         icase,
         newline,
     };
@@ -287,10 +288,15 @@ pub fn compile(mut ast: Ast, icase: bool, newline: bool) -> Result<Program, Erro
         head_class(&ast)
             .and_then(|cl| fold_class(&cl, icase).ok())
             .map(|mut cl| {
+                // Mirror `emit`'s REG_NEWLINE handling for `Ast::Class`: a
+                // negated head class must not treat `\n` as a valid scan
+                // candidate when the compiled instruction itself excludes
+                // it, or the hint offers positions the VM will reject.
+                if newline && cl.negated {
+                    cl.ranges.push(('\n', '\n'));
+                }
                 normalize_ranges(&mut cl.ranges);
-                let index = c.classes.len();
-                c.classes.push(CompiledClass::new(cl));
-                index
+                c.intern_class(cl)
             })
     };
     let literal = if group_count > 1 {
@@ -657,6 +663,17 @@ fn max_group(ast: &Ast) -> u32 {
 struct Compiler {
     insts: Vec<Inst>,
     classes: Vec<CompiledClass>,
+    /// Interns `classes` by fully-processed (folded, newline-adjusted,
+    /// normalized) content, so occurrences of the same bracket expression —
+    /// a repeated body (`[0-9]{100}`), shared alternation branches, or the
+    /// `first_class` scan hint duplicating a class also used in the body —
+    /// compile to one shared `CompiledClass` instead of a fresh copy (and a
+    /// fresh 128-entry ASCII bitmap computation) each time. A `HashMap`
+    /// rather than a linear scan: patterns can legally contain thousands of
+    /// distinct classes, and a shell compiles user-supplied patterns, so
+    /// lookup must stay average-case O(1) rather than open an O(n²)
+    /// compile-time hole of the kind this engine exists to avoid.
+    class_index: std::collections::HashMap<Class, usize>,
     icase: bool,
     newline: bool,
 }
@@ -680,6 +697,19 @@ fn normalize_ranges(ranges: &mut Vec<(char, char)>) {
 }
 
 impl Compiler {
+    /// Interns a fully-processed class (folded, newline-adjusted,
+    /// normalized — the caller must finish all of that first), returning
+    /// its shared `classes` index. See the `class_index` field doc.
+    fn intern_class(&mut self, class: Class) -> usize {
+        if let Some(&index) = self.class_index.get(&class) {
+            return index;
+        }
+        let index = self.classes.len();
+        self.classes.push(CompiledClass::new(class.clone()));
+        self.class_index.insert(class, index);
+        index
+    }
+
     /// Appends an instruction, returning its index; errors past the size cap.
     fn push(&mut self, inst: Inst) -> Result<usize, Error> {
         if self.insts.len() >= MAX_PROGRAM_SIZE {
@@ -712,8 +742,7 @@ impl Compiler {
                     class.ranges.push(('\n', '\n'));
                 }
                 normalize_ranges(&mut class.ranges);
-                let index = self.classes.len();
-                self.classes.push(CompiledClass::new(class));
+                let index = self.intern_class(class);
                 self.push(Inst::Class(index))?;
             }
             Ast::StartAnchor => {

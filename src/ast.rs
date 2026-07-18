@@ -50,7 +50,7 @@ pub enum Ast {
 
 /// A bracket expression: a (possibly negated) set of codepoint ranges and
 /// POSIX classes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Class {
     pub negated: bool,
     /// Inclusive codepoint ranges; a single char is a degenerate range.
@@ -59,7 +59,7 @@ pub struct Class {
 }
 
 /// A named POSIX class inside a bracket expression, e.g. `[[:alpha:]]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PosixClass {
     Alnum,
     Alpha,
