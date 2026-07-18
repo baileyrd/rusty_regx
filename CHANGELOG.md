@@ -6,6 +6,8 @@ All notable changes to this crate are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-18
+
 ### Added
 
 - `examples/grep.rs`; `Match::len`/`is_empty`; `Debug` for the iterator

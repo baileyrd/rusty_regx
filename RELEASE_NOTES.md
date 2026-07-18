@@ -6,6 +6,51 @@ anything mentioned here, see the [cookbook](docs/COOKBOOK.md).
 
 ---
 
+## 0.5.0 — July 18, 2026
+
+**Hardening and a POSIX-mode performance gap closed.** No API changes —
+this release is about a crash fixed, a mode brought back up to speed,
+and cheaper cloning.
+
+### 🐛 Fixed
+
+- A pattern with enough stacked quantifiers (`a****…`, `a{2}{2}{2}…`)
+  could crash the process with a stack overflow — closes the same class
+  of bug 0.2.0 fixed for nested groups, reached this time through `*`
+  instead of `(`.
+- `` \` ``/`\'` (GNU absolute buffer anchors) incorrectly matched at
+  every line boundary under line-mode matching, instead of only the
+  true start/end of the whole input.
+- `is_match` (only) could report a false match for `\b`-style patterns
+  right after the scanner skipped ahead to a promising position.
+
+### ⚡ Faster
+
+- **`Regex::new_posix`'s class-headed patterns** (`[0-9]+`, `\w+`, and
+  friends) now get the same scan-forward speedup `Regex::new` already
+  had — about 150x faster on a large no-match in local testing. POSIX
+  mode had silently fallen behind on exactly this shape of pattern.
+- **`Regex::clone()` is instant** now, instead of copying the whole
+  compiled pattern — clone and share a `Regex` freely, the way you
+  would with the `regex` crate.
+- Patterns that repeat the same bracket expression (`[0-9]{100}`, or
+  the same class reused across `a|b` branches) compile faster and take
+  less memory — the class is compiled once and shared, not rebuilt at
+  every occurrence.
+- Case-insensitive literal patterns (`Regex::new_ci(...)`) scan a bit
+  faster over large no-match text.
+
+### 🛠️ Under the hood
+
+- `debug_dump()` now shows the class-head scan hint too, not just the
+  literal prefix/suffix — one less blind spot when asking "why is this
+  pattern slow?".
+- `cargo audit` and Miri now run in CI on every change, and the
+  benchmark suite gained a check that would have caught the POSIX-mode
+  slowdown above automatically.
+
+---
+
 ## 0.4.0 — July 17, 2026
 
 **Real bash patterns, out of the box.** This release makes the engine
