@@ -61,10 +61,15 @@ std::thread_local! {
 }
 
 /// A compiled regular expression program.
+///
+/// `Clone` is O(1): the compiled program is reference-counted, not
+/// deep-copied, so sharing a `Regex` across threads or call sites (the
+/// `regex` crate's usual `clone()`-and-share pattern) doesn't re-pay the
+/// instruction/class table's size on every clone.
 #[derive(Clone)]
 pub struct Regex {
     pattern: Box<str>,
-    program: compile::Program,
+    program: std::sync::Arc<compile::Program>,
     posix: bool,
 }
 
@@ -156,7 +161,7 @@ impl Regex {
         newline: bool,
     ) -> Result<Regex, Error> {
         let ast = parser::parse(pattern)?;
-        let program = compile::compile(ast, icase, newline)?;
+        let program = std::sync::Arc::new(compile::compile(ast, icase, newline)?);
         Ok(Regex {
             pattern: pattern.into(),
             program,
@@ -203,6 +208,11 @@ impl Regex {
         }
         if !p.prefix.is_empty() {
             let _ = writeln!(out, "scan prefix: {:?}", p.prefix);
+        } else if let Some(i) = p.first_class {
+            let _ = writeln!(
+                out,
+                "scan hint: mandatory head class (classes[{i}], see the instruction listing)",
+            );
         }
         if !p.suffix.is_empty() {
             let _ = writeln!(

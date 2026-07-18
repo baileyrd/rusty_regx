@@ -71,6 +71,22 @@ fn main() {
         time(20, || theirs.is_match(&text)),
     );
 
+    // Class-headed pattern in POSIX mode: no `regex`-crate equivalent to
+    // compare against, so compare the two of *our* modes against each
+    // other instead. Both share the same compiled `Program` (`posix` only
+    // picks the VM entry point) and so must share every scan-hint
+    // fast-forward — if POSIX mode ever regresses to the unaccelerated
+    // per-char path while leftmost-first keeps the class-head fast-forward
+    // (`Program::first_class`), this row goes from parity to orders of
+    // magnitude apart.
+    let ours_cls_first = rusty_regx::Regex::new("[0-9]+").unwrap();
+    let ours_cls_posix = rusty_regx::Regex::new_posix("[0-9]+").unwrap();
+    row(
+        "is_match, [0-9]+ 96KB no-match (leftmost-first / POSIX)",
+        time(20, || ours_cls_first.is_match(&text)),
+        time(20, || ours_cls_posix.is_match(&text)),
+    );
+
     // Anchored no-match on a large haystack: the anchored fast path skips
     // the scan entirely (rush's `=~` patterns are usually `^...$`-shaped).
     let ours_anchored = rusty_regx::Regex::new("^nope").unwrap();
