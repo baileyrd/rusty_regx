@@ -106,7 +106,12 @@ fn class_matches_general(class: &Class, c: char) -> bool {
 
 /// POSIX classes are ASCII-first, with `char` method fallbacks where they
 /// have a sensible Unicode meaning (per DESIGN.md — no Unicode tables).
-fn posix_matches(class: PosixClass, c: char) -> bool {
+///
+/// `pub(crate)`: also used by the glob translator (`docs/GLOB_DESIGN.md`)
+/// to decide, at parse time, whether a bracket expression's POSIX classes
+/// already exclude the specific characters pathname/period mode must
+/// exclude (`/`, a leading `.`) before it needs to touch `ranges` at all.
+pub(crate) fn posix_matches(class: PosixClass, c: char) -> bool {
     match class {
         PosixClass::Alnum => c.is_alphanumeric(),
         PosixClass::Alpha => c.is_alphabetic(),

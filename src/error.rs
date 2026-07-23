@@ -65,6 +65,17 @@ pub enum ErrorKind {
     /// Restricted-v1 support (`docs/GLOB_DESIGN.md`) only allows `!(...)`
     /// as the whole top-level pattern.
     EmbeddedGlobNegation,
+    /// A positive (non-negated) glob bracket expression matches a
+    /// character that `pathname`/`period` mode must exclude (`/`, or a
+    /// leading `.`) only via a POSIX class (`[[:punct:]]`, `[[:print:]]`,
+    /// or `[[:graph:]]`) rather than an explicit range — that can't be
+    /// losslessly narrowed with the current `Class` representation.
+    GlobClassExclusionUnsupported,
+    /// `period` mode's leading-dot rule can't be applied because the
+    /// pattern's first consumed character isn't a single fixed position
+    /// (it starts with `*`, or an extglob group) — restricted-v1 doesn't
+    /// support this composition; write an explicit leading `.` instead.
+    GlobLeadingPeriodUnsupported,
 }
 
 impl fmt::Display for Error {
@@ -83,6 +94,12 @@ impl fmt::Display for Error {
             ErrorKind::RepetitionTooLarge => "repetition interval is too large",
             ErrorKind::EmbeddedGlobNegation => {
                 "glob !(...) negation is only supported as the entire pattern, not embedded in a larger one"
+            }
+            ErrorKind::GlobClassExclusionUnsupported => {
+                "a positive bracket expression matches a character pathname/period mode must exclude via an unsupported POSIX class"
+            }
+            ErrorKind::GlobLeadingPeriodUnsupported => {
+                "period mode's leading-dot rule needs a fixed first character, not a repetition or extglob group"
             }
         };
         match self.pos {
