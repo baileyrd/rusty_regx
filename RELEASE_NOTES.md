@@ -62,8 +62,27 @@ engine as ERE matching — see `docs/GLOB_DESIGN.md` for the full plan.
   negation all just work, since each candidate reuses `Glob::matches`
   directly.
 
-With this, `Glob`'s API sketch from `docs/GLOB_DESIGN.md` is complete —
-what's left under #20 is the differential harness against bash.
+With this, `Glob`'s API sketch from `docs/GLOB_DESIGN.md` is complete.
+
+### 🐛 Found along the way
+
+- Discovered (not fixed here — it's bash's, not ours) that bash 5.2's
+  own extglob matcher has real correctness bugs: `@(...)`/`+(...)`
+  (the mandatory-occurrence extglob operators) can wrongly fail to
+  match when their content can itself expand to empty, e.g. `[[ "" ==
+  *@(*) ]]` is false in bash even though every piece — `*` alone,
+  `@(*)` alone, and the swapped `@(*)*` — matches. `Glob` gets this
+  right; the differential harness's generator works around it so the
+  harness measures *our* correctness, not bash's.
+
+### ✅ New tests
+
+- A differential harness (`tests/glob_differential.rs`) cross-checking
+  `Glob` against bash's `[[ == ]]` *and* `case` — and cross-checking
+  those two bash constructs against each other — plus an adversarial
+  `*(a|aa)*(a|aa)b`-style linear-time check, extending the same
+  no-backtracking guarantee proof `tests/matching.rs` already has for
+  ERE patterns to extglob ones.
 
 ---
 
