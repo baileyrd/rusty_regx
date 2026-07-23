@@ -58,12 +58,13 @@ use crate::error::{Error, ErrorKind};
 /// few thousand `*` builds an arbitrarily deep `Repeat` chain with nothing
 /// to stop it and aborts the process downstream. 250 matches the `regex`
 /// crate's default `nest_limit`.
-const MAX_NESTING_DEPTH: u32 = 250;
+pub(crate) const MAX_NESTING_DEPTH: u32 = 250;
 
 /// Rejects a structural depth beyond the cap. `depth` is the depth the node
 /// being constructed *would* have (child depth + 1); `at` is the position to
-/// blame.
-fn check_depth(depth: u32, at: usize) -> Result<(), Error> {
+/// blame. Shared with the glob translator (`docs/GLOB_DESIGN.md`: "the
+/// nesting-depth cap carries over").
+pub(crate) fn check_depth(depth: u32, at: usize) -> Result<(), Error> {
     if depth > MAX_NESTING_DEPTH {
         Err(Error::new(ErrorKind::NestingTooDeep, Some(at)))
     } else {

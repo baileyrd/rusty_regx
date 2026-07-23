@@ -6,16 +6,17 @@
 //! every execution tier (literal path, prefix/suffix, anchors, Pike VM)
 //! and inherits the same non-negotiable guarantee: no backtracking, ever.
 //!
-//! This module currently covers the foundation only: `?`, `*`,
-//! `[...]`/`[!...]`, literals, and whole-pattern (full-string) matching.
-//! Extglob operators (`@()` `?()` `*()` `+()`), `!()` negation, pathname
-//! mode, leading-period rules, case-insensitivity, and prefix/suffix
-//! matching are follow-up issues tracked under #20.
+//! Covered so far: `?`, `*`, `[...]`/`[!...]`, literals, whole-pattern
+//! (full-string) matching, and the bash extglob operators `@()` `?()`
+//! `*()` `+()`. `!()` negation, pathname mode, leading-period rules,
+//! case-insensitivity, and prefix/suffix matching are follow-up issues
+//! tracked under #20.
 
 use crate::ast::Ast;
 use crate::bracket;
 use crate::compile::{self, Program};
 use crate::error::{Error, ErrorKind};
+use crate::parser;
 use std::sync::Arc;
 
 /// Builds a [`Glob`] with non-default options.
@@ -39,7 +40,8 @@ impl GlobBuilder {
     ///
     /// Returns a structured [`Error`] describing the first problem found
     /// in the pattern — the same [`ErrorKind`] variants POSIX-ERE parsing
-    /// uses, since glob patterns share the bracket-expression grammar.
+    /// uses, since glob patterns share the bracket-expression grammar and
+    /// the group-nesting depth cap.
     pub fn build(&self, pattern: &str) -> Result<Glob, Error> {
         let ast = parse(pattern)?;
         // Glob matching is always full-string (unlike `Regex`, which
@@ -52,7 +54,8 @@ impl GlobBuilder {
     }
 }
 
-/// A compiled shell glob pattern (`fnmatch`-style: `?`, `*`, `[...]`).
+/// A compiled shell glob pattern (`fnmatch`-style: `?`, `*`, `[...]`, and
+/// the bash extglob operators `@()` `?()` `*()` `+()`).
 ///
 /// Unlike [`crate::Regex`], matching is always a full match against the
 /// whole input — glob patterns describe an entire name, not a substring
@@ -82,6 +85,10 @@ impl Glob {
     /// let g = Glob::new("*.txt")?;
     /// assert!(g.matches("notes.txt"));
     /// assert!(!g.matches("notes.txt.bak"));
+    ///
+    /// let extglob = Glob::new("@(foo|bar).txt")?;
+    /// assert!(extglob.matches("foo.txt"));
+    /// assert!(!extglob.matches("baz.txt"));
     /// # Ok::<(), rusty_regx::Error>(())
     /// ```
     pub fn new(pattern: &str) -> Result<Glob, Error> {
@@ -104,13 +111,10 @@ fn parse(pattern: &str) -> Result<Ast, Error> {
         pattern,
         byte_pos: 0,
         char_pos: 0,
+        depth: 0,
     };
-    let items = p.items()?;
-    Ok(match items.len() {
-        0 => Ast::Empty,
-        1 => items.into_iter().next().expect("checked len == 1"),
-        _ => Ast::Concat(items),
-    })
+    let (ast, _depth) = p.concat(false)?;
+    Ok(ast)
 }
 
 /// Negation characters glob accepts inside `[...]` — `!` alongside the
@@ -121,6 +125,11 @@ struct Parser<'p> {
     pattern: &'p str,
     byte_pos: usize,
     char_pos: usize,
+    /// Extglob group-nesting recursion depth, checked eagerly at each `(`
+    /// (mirrors `parser::Parser::depth`) so pathological nesting like
+    /// `@(@(@(@(…` can't overflow this parser's own call stack before the
+    /// depth cap is ever consulted.
+    depth: u32,
 }
 
 impl Parser<'_> {
@@ -132,6 +141,10 @@ impl Parser<'_> {
         self.rest().chars().next()
     }
 
+    fn peek_at(&self, offset: usize) -> Option<char> {
+        self.rest().chars().nth(offset)
+    }
+
     fn bump(&mut self) -> Option<char> {
         let c = self.peek();
         if let Some(c) = c {
@@ -141,55 +154,147 @@ impl Parser<'_> {
         c
     }
 
-    /// `items := (atom)*` — a flat sequence; glob has no alternation or
-    /// grouping outside the extglob operators (a later issue).
-    fn items(&mut self) -> Result<Vec<Ast>, Error> {
-        let mut items = Vec::new();
-        while let Some(c) = self.peek() {
-            let item = match c {
-                '?' => {
-                    self.bump();
-                    Ast::AnyChar
-                }
-                '*' => {
-                    self.bump();
+    fn eat(&mut self, c: char) -> bool {
+        if self.peek() == Some(c) {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `alternation := concat ('|' concat)*` — only meaningful inside an
+    /// extglob group's parentheses; plain glob has no top-level
+    /// alternation (a bare `|` outside `@()`/`?()`/`*()`/`+()` is literal).
+    fn alternation(&mut self) -> Result<(Ast, u32), Error> {
+        let mut branches = vec![self.concat(true)?];
+        while self.eat('|') {
+            branches.push(self.concat(true)?);
+        }
+        let depth = branches.iter().map(|(_, d)| *d).max().unwrap_or(0);
+        let ast = if branches.len() == 1 {
+            branches.pop().unwrap().0
+        } else {
+            Ast::Alternation(branches.into_iter().map(|(ast, _)| ast).collect())
+        };
+        Ok((ast, depth))
+    }
+
+    /// `concat := atom*`. At top level (`in_group == false`) this consumes
+    /// the whole pattern, treating `|` and `)` as literal characters (there
+    /// is nothing for them to delimit outside an extglob group). Inside a
+    /// group, stops at `|` or `)` so [`Parser::alternation`] and
+    /// [`Parser::extglob_group`] can see them.
+    fn concat(&mut self, in_group: bool) -> Result<(Ast, u32), Error> {
+        let mut items: Vec<(Ast, u32)> = Vec::new();
+        loop {
+            match self.peek() {
+                None => break,
+                Some('|') | Some(')') if in_group => break,
+                _ => {}
+            }
+            items.push(self.atom()?);
+        }
+        let depth = items.iter().map(|(_, d)| *d).max().unwrap_or(0);
+        let ast = match items.len() {
+            0 => Ast::Empty,
+            1 => items.pop().unwrap().0,
+            _ => Ast::Concat(items.into_iter().map(|(ast, _)| ast).collect()),
+        };
+        Ok((ast, depth))
+    }
+
+    fn atom(&mut self) -> Result<(Ast, u32), Error> {
+        let c = self.peek().expect("atom() called with input remaining");
+        // Extglob operator: `@`/`?`/`*`/`+` immediately followed by `(`.
+        // (`!(` is a separate, later issue — see docs/GLOB_DESIGN.md.)
+        if matches!(c, '@' | '?' | '*' | '+') && self.peek_at(1) == Some('(') {
+            return self.extglob_group(c);
+        }
+        match c {
+            '?' => {
+                self.bump();
+                Ok((Ast::AnyChar, 0))
+            }
+            '*' => {
+                self.bump();
+                Ok((
                     Ast::Repeat {
                         ast: Box::new(Ast::AnyChar),
                         min: 0,
                         max: None,
                         slot: 0,
-                    }
+                    },
+                    0,
+                ))
+            }
+            '[' => {
+                let open = self.char_pos;
+                self.bump();
+                let mut cursor = bracket::Cursor::new(self.pattern, self.byte_pos, self.char_pos);
+                let class = bracket::parse(&mut cursor, open, &NEGATION_CHARS)?;
+                self.byte_pos = cursor.byte_pos;
+                self.char_pos = cursor.char_pos;
+                Ok((Ast::Class(class), 0))
+            }
+            '\\' => {
+                self.bump();
+                match self.bump() {
+                    Some(c) => Ok((Ast::Char(c), 0)),
+                    None => Err(Error::new(
+                        ErrorKind::TrailingBackslash,
+                        Some(self.char_pos),
+                    )),
                 }
-                '[' => {
-                    let open = self.char_pos;
-                    self.bump();
-                    let mut cursor =
-                        bracket::Cursor::new(self.pattern, self.byte_pos, self.char_pos);
-                    let class = bracket::parse(&mut cursor, open, &NEGATION_CHARS)?;
-                    self.byte_pos = cursor.byte_pos;
-                    self.char_pos = cursor.char_pos;
-                    Ast::Class(class)
-                }
-                '\\' => {
-                    self.bump();
-                    match self.bump() {
-                        Some(c) => Ast::Char(c),
-                        None => {
-                            return Err(Error::new(
-                                ErrorKind::TrailingBackslash,
-                                Some(self.char_pos),
-                            ))
-                        }
-                    }
-                }
-                _ => {
-                    self.bump();
-                    Ast::Char(c)
-                }
-            };
-            items.push(item);
+            }
+            _ => {
+                self.bump();
+                Ok((Ast::Char(c), 0))
+            }
         }
-        Ok(items)
+    }
+
+    /// Parses `@(...)` / `?(...)` / `*(...)` / `+(...)` (the leading
+    /// operator char has been peeked, not consumed) into the matching AST
+    /// node — see `docs/GLOB_DESIGN.md`'s "Translation" table.
+    fn extglob_group(&mut self, op: char) -> Result<(Ast, u32), Error> {
+        let open = self.char_pos;
+        self.bump(); // op
+        self.bump(); // '('
+        self.depth += 1;
+        if self.depth > parser::MAX_NESTING_DEPTH {
+            return Err(Error::new(ErrorKind::NestingTooDeep, Some(open)));
+        }
+        let (inner, inner_depth) = self.alternation()?;
+        if !self.eat(')') {
+            return Err(Error::new(ErrorKind::UnbalancedParenthesis, Some(open)));
+        }
+        self.depth -= 1;
+        let depth = inner_depth + 1;
+        parser::check_depth(depth, open)?;
+        let ast = match op {
+            '@' => inner,
+            '*' => Ast::Repeat {
+                ast: Box::new(inner),
+                min: 0,
+                max: None,
+                slot: 0,
+            },
+            '+' => Ast::Repeat {
+                ast: Box::new(inner),
+                min: 1,
+                max: None,
+                slot: 0,
+            },
+            '?' => Ast::Repeat {
+                ast: Box::new(inner),
+                min: 0,
+                max: Some(1),
+                slot: 0,
+            },
+            _ => unreachable!("caller only dispatches here for @ ? * +"),
+        };
+        Ok((ast, depth))
     }
 }
 
@@ -279,11 +384,90 @@ mod tests {
     }
 
     #[test]
+    fn extglob_at_is_alternation() {
+        assert!(matches("@(foo|bar)", "foo"));
+        assert!(matches("@(foo|bar)", "bar"));
+        assert!(!matches("@(foo|bar)", "baz"));
+        assert!(!matches("@(foo|bar)", "foobar"));
+    }
+
+    #[test]
+    fn extglob_star_is_zero_or_more() {
+        assert!(matches("*(ab)", ""));
+        assert!(matches("*(ab)", "ab"));
+        assert!(matches("*(ab)", "ababab"));
+        assert!(!matches("*(ab)", "aba"));
+    }
+
+    #[test]
+    fn extglob_plus_is_one_or_more() {
+        assert!(!matches("+(ab)", ""));
+        assert!(matches("+(ab)", "ab"));
+        assert!(matches("+(ab)", "ababab"));
+    }
+
+    #[test]
+    fn extglob_question_is_zero_or_one() {
+        assert!(matches("?(ab)", ""));
+        assert!(matches("?(ab)", "ab"));
+        assert!(!matches("?(ab)", "abab"));
+    }
+
+    #[test]
+    fn extglob_single_alternative_needs_no_pipe() {
+        assert!(matches("@(ab)", "ab"));
+        assert!(!matches("@(ab)", "ac"));
+    }
+
+    #[test]
+    fn extglob_composes_with_surrounding_literals_and_classes() {
+        assert!(matches("file.@(txt|md)", "file.txt"));
+        assert!(matches("file.@(txt|md)", "file.md"));
+        assert!(!matches("file.@(txt|md)", "file.rs"));
+        assert!(matches("[Rr]eadme.*(bak)", "Readme."));
+        assert!(matches("[Rr]eadme.*(bak)", "Readme.bakbak"));
+    }
+
+    #[test]
+    fn extglob_nests() {
+        assert!(matches("@(a|@(b|c))", "a"));
+        assert!(matches("@(a|@(b|c))", "b"));
+        assert!(matches("@(a|@(b|c))", "c"));
+        assert!(!matches("@(a|@(b|c))", "d"));
+        assert!(matches("*(a|@(bc)*)", "abcbc"));
+    }
+
+    #[test]
+    fn extglob_operator_char_is_literal_without_paren() {
+        // `@`/`+` (and `?`/`*` without a following `(`) outside extglob
+        // context keep their ordinary meaning: `@`/`+` are plain literals,
+        // `?`/`*` are the classic single-char/any-run wildcards.
+        assert!(matches("a@b", "a@b"));
+        assert!(matches("a+b", "a+b"));
+        assert!(!matches("a@b", "ab"));
+    }
+
+    #[test]
     fn errors() {
         assert_eq!(err("[abc"), ErrorKind::UnclosedBracket);
         assert_eq!(err(r"a\"), ErrorKind::TrailingBackslash);
         assert_eq!(err("[z-a]"), ErrorKind::InvalidRange);
         assert_eq!(err("[[:bogus:]]"), ErrorKind::InvalidPosixClass);
+        assert_eq!(err("@(foo|bar"), ErrorKind::UnbalancedParenthesis);
+        assert_eq!(err("@(foo"), ErrorKind::UnbalancedParenthesis);
+    }
+
+    #[test]
+    fn deeply_nested_extglob_is_rejected() {
+        let mut pattern = String::new();
+        for _ in 0..300 {
+            pattern.push_str("@(");
+        }
+        pattern.push('a');
+        for _ in 0..300 {
+            pattern.push(')');
+        }
+        assert_eq!(err(&pattern), ErrorKind::NestingTooDeep);
     }
 
     #[test]

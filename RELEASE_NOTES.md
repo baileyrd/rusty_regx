@@ -24,10 +24,15 @@ engine as ERE matching — see `docs/GLOB_DESIGN.md` for the full plan.
   equivalence forms) work exactly as in `Regex`, plus glob's `!` as an
   alternative negation marker alongside POSIX `^` (`[!abc]` and `[^abc]`
   are equivalent).
+- The bash extglob operators: `@(a|b)` (exactly one alternative), `*(p)`
+  (zero or more), `+(p)` (one or more), `?(p)` (zero or one) — nest freely
+  (`@(a|@(b|c))`) and compose with everything else (`file.@(txt|md)`).
+  Same nesting-depth cap as ERE groups, and the same guarantee: no
+  backtracking, however the alternatives are arranged.
 
-Extglob operators (`@()` `?()` `*()` `+()` `!()`), pathname mode,
-leading-period rules, case-insensitivity, and prefix/suffix matching
-(`${var#pat}` and friends) land in follow-up rounds — see #20.
+`!()` negation, pathname mode, leading-period rules, case-insensitivity,
+and prefix/suffix matching (`${var#pat}` and friends) land in follow-up
+rounds — see #20.
 
 ---
 
