@@ -7,8 +7,9 @@
 //! and inherits the same non-negotiable guarantee: no backtracking, ever.
 //!
 //! Covered so far: `?`, `*`, `[...]`/`[!...]`, literals, whole-pattern
-//! (full-string) matching, and the bash extglob operators `@()` `?()`
-//! `*()` `+()`. `!()` negation, pathname mode, leading-period rules,
+//! (full-string) matching, the bash extglob operators `@()` `?()` `*()`
+//! `+()`, and `!()` negation restricted to the whole pattern (see
+//! [`GlobBuilder::build`]). Pathname mode, leading-period rules,
 //! case-insensitivity, and prefix/suffix matching are follow-up issues
 //! tracked under #20.
 
@@ -42,7 +43,43 @@ impl GlobBuilder {
     /// in the pattern — the same [`ErrorKind`] variants POSIX-ERE parsing
     /// uses, since glob patterns share the bracket-expression grammar and
     /// the group-nesting depth cap.
+    ///
+    /// `!(p)` negation is supported only as the *entire* pattern (e.g.
+    /// `"!(foo|bar)"`), per `docs/GLOB_DESIGN.md`'s restricted-v1 plan:
+    /// glob matching is always full-string, so a whole-pattern `!(p)` is
+    /// just the boolean complement of matching `p`, computed by compiling
+    /// `p` on its own and negating [`Glob::matches`]'s result — no NFA
+    /// complement needed. `!(p)` anywhere else (embedded in a larger
+    /// pattern, or nested inside another extglob group) is a compile
+    /// error ([`ErrorKind::EmbeddedGlobNegation`]) rather than silently
+    /// mismatching — the general embedded case needs a forbidden-spans
+    /// refinement loop the design doc defers to a later round.
     pub fn build(&self, pattern: &str) -> Result<Glob, Error> {
+        if let Some(rest) = pattern.strip_prefix("!(") {
+            // `char_pos` starts biased by 2 (for "!(") purely so error
+            // positions this sub-parse reports land on the right offset
+            // into the *original* pattern; byte-slicing stays correct
+            // because it only ever indexes into `rest`.
+            let mut p = Parser {
+                pattern: rest,
+                byte_pos: 0,
+                char_pos: 2,
+                depth: 1,
+            };
+            let (inner, _depth) = p.alternation()?;
+            if !p.eat(')') || p.peek().is_some() {
+                // Either the negation group never closed, or there's more
+                // pattern after it — either way this isn't "the entire
+                // pattern is `!(...)`", so it falls under the unsupported
+                // embedded case rather than a silent (wrong) parse.
+                return Err(Error::new(ErrorKind::EmbeddedGlobNegation, Some(0)));
+            }
+            let wrapped = Ast::Concat(vec![Ast::StartAnchor, inner, Ast::EndAnchor]);
+            let program = Arc::new(compile::compile(wrapped, false, false)?);
+            return Ok(Glob {
+                compiled: Compiled::Negated(program),
+            });
+        }
         let ast = parse(pattern)?;
         // Glob matching is always full-string (unlike `Regex`, which
         // searches): wrapping in `^...$` gets that for free from the
@@ -50,19 +87,30 @@ impl GlobBuilder {
         // "full match" mode needed in the VM.
         let wrapped = Ast::Concat(vec![Ast::StartAnchor, ast, Ast::EndAnchor]);
         let program = Arc::new(compile::compile(wrapped, false, false)?);
-        Ok(Glob { program })
+        Ok(Glob {
+            compiled: Compiled::Positive(program),
+        })
     }
 }
 
-/// A compiled shell glob pattern (`fnmatch`-style: `?`, `*`, `[...]`, and
-/// the bash extglob operators `@()` `?()` `*()` `+()`).
+/// A compiled shell glob pattern (`fnmatch`-style: `?`, `*`, `[...]`, the
+/// bash extglob operators `@()` `?()` `*()` `+()`, and whole-pattern
+/// `!()` negation).
 ///
 /// Unlike [`crate::Regex`], matching is always a full match against the
 /// whole input — glob patterns describe an entire name, not a substring
 /// to search for.
 #[derive(Clone)]
 pub struct Glob {
-    program: Arc<Program>,
+    compiled: Compiled,
+}
+
+#[derive(Clone)]
+enum Compiled {
+    /// Matches iff the program matches.
+    Positive(Arc<Program>),
+    /// Matches iff the program does *not* match — a whole-pattern `!(p)`.
+    Negated(Arc<Program>),
 }
 
 /// Shows the compiled program is opaque — there's no source pattern
@@ -89,6 +137,10 @@ impl Glob {
     /// let extglob = Glob::new("@(foo|bar).txt")?;
     /// assert!(extglob.matches("foo.txt"));
     /// assert!(!extglob.matches("baz.txt"));
+    ///
+    /// let negated = Glob::new("!(foo|bar)")?;
+    /// assert!(negated.matches("baz"));
+    /// assert!(!negated.matches("foo"));
     /// # Ok::<(), rusty_regx::Error>(())
     /// ```
     pub fn new(pattern: &str) -> Result<Glob, Error> {
@@ -100,7 +152,13 @@ impl Glob {
     /// Glob patterns always match the *whole* string — there is no
     /// substring-search mode, unlike [`crate::Regex::is_match`].
     pub fn matches(&self, name: &str) -> bool {
-        crate::SCRATCH.with(|s| crate::vm::exec_bool(&self.program, name, 0, &mut s.borrow_mut()))
+        let (program, negate) = match &self.compiled {
+            Compiled::Positive(program) => (program, false),
+            Compiled::Negated(program) => (program, true),
+        };
+        let matched =
+            crate::SCRATCH.with(|s| crate::vm::exec_bool(program, name, 0, &mut s.borrow_mut()));
+        matched != negate
     }
 }
 
@@ -207,9 +265,19 @@ impl Parser<'_> {
     fn atom(&mut self) -> Result<(Ast, u32), Error> {
         let c = self.peek().expect("atom() called with input remaining");
         // Extglob operator: `@`/`?`/`*`/`+` immediately followed by `(`.
-        // (`!(` is a separate, later issue — see docs/GLOB_DESIGN.md.)
         if matches!(c, '@' | '?' | '*' | '+') && self.peek_at(1) == Some('(') {
             return self.extglob_group(c);
+        }
+        // `!(...)` reaching here means it's *not* the whole top-level
+        // pattern (that case is intercepted in `GlobBuilder::build` before
+        // any `Parser` runs) — restricted-v1 doesn't support it embedded,
+        // however deeply, so reject clearly instead of parsing `!` as a
+        // literal and `(...)` as something it isn't.
+        if c == '!' && self.peek_at(1) == Some('(') {
+            return Err(Error::new(
+                ErrorKind::EmbeddedGlobNegation,
+                Some(self.char_pos),
+            ));
         }
         match c {
             '?' => {
@@ -445,6 +513,59 @@ mod tests {
         assert!(matches("a@b", "a@b"));
         assert!(matches("a+b", "a+b"));
         assert!(!matches("a@b", "ab"));
+    }
+
+    #[test]
+    fn negation_whole_pattern() {
+        assert!(matches("!(foo|bar)", "baz"));
+        assert!(!matches("!(foo|bar)", "foo"));
+        assert!(!matches("!(foo|bar)", "bar"));
+        assert!(matches("!(foo)", "bar"));
+        assert!(!matches("!(foo)", "foo"));
+    }
+
+    #[test]
+    fn negation_single_alternative_needs_no_pipe() {
+        assert!(matches("!(ab)", "ac"));
+        assert!(!matches("!(ab)", "ab"));
+    }
+
+    #[test]
+    fn negation_of_empty_matches_any_nonempty_string() {
+        assert!(matches("!()", "anything"));
+        assert!(!matches("!()", ""));
+    }
+
+    #[test]
+    fn negation_composes_with_other_atoms_inside_the_group() {
+        assert!(matches("!(a*|b?)", "c"));
+        assert!(matches("!(a*|b?)", "bxx"));
+        assert!(!matches("!(a*|b?)", "abc"));
+        assert!(!matches("!(a*|b?)", "bx"));
+    }
+
+    #[test]
+    fn negation_must_be_the_entire_pattern() {
+        // Embedded (anywhere but as the whole pattern) is unsupported in
+        // restricted v1 — a clear error, not a silent wrong parse.
+        assert_eq!(err("a!(b)c"), ErrorKind::EmbeddedGlobNegation);
+        assert_eq!(err("!(a)b"), ErrorKind::EmbeddedGlobNegation);
+        assert_eq!(err("a!(b)"), ErrorKind::EmbeddedGlobNegation);
+        assert_eq!(err("@(!(a)|b)"), ErrorKind::EmbeddedGlobNegation);
+        assert_eq!(err("*(!(a))"), ErrorKind::EmbeddedGlobNegation);
+        assert_eq!(err("!(!(a))"), ErrorKind::EmbeddedGlobNegation);
+    }
+
+    #[test]
+    fn negation_unterminated_group_is_an_error() {
+        assert_eq!(err("!(abc"), ErrorKind::EmbeddedGlobNegation);
+    }
+
+    #[test]
+    fn bang_without_paren_is_literal() {
+        assert!(matches("a!b", "a!b"));
+        assert!(!matches("a!b", "ab"));
+        assert!(matches("!", "!"));
     }
 
     #[test]

@@ -14,6 +14,8 @@ All notable changes to this crate are documented here. The format follows
   `docs/GLOB_DESIGN.md`.
 - `Glob` extglob operators `@(a|b)`, `*(p)`, `+(p)`, `?(p)`, arbitrarily
   nested, sharing the same group-nesting depth cap as ERE `(...)`.
+- `Glob` `!(p)` negation, restricted-v1: only supported as the entire
+  pattern (`ErrorKind::EmbeddedGlobNegation` if embedded elsewhere).
 
 ### Internal
 

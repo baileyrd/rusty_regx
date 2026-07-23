@@ -60,6 +60,11 @@ pub enum ErrorKind {
     NestingTooDeep,
     /// An interval expansion exceeds the program-size cap.
     RepetitionTooLarge,
+    /// A glob `!(...)` negation that isn't the *entire* pattern (e.g.
+    /// `a!(b)c`, or `!(...)` nested inside another extglob group).
+    /// Restricted-v1 support (`docs/GLOB_DESIGN.md`) only allows `!(...)`
+    /// as the whole top-level pattern.
+    EmbeddedGlobNegation,
 }
 
 impl fmt::Display for Error {
@@ -76,6 +81,9 @@ impl fmt::Display for Error {
             ErrorKind::TrailingBackslash => "pattern ends with a trailing backslash",
             ErrorKind::NestingTooDeep => "expression is nested too deeply",
             ErrorKind::RepetitionTooLarge => "repetition interval is too large",
+            ErrorKind::EmbeddedGlobNegation => {
+                "glob !(...) negation is only supported as the entire pattern, not embedded in a larger one"
+            }
         };
         match self.pos {
             Some(pos) => write!(f, "{msg} at position {pos}"),
