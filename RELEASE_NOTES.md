@@ -36,10 +36,22 @@ engine as ERE matching — see `docs/GLOB_DESIGN.md` for the full plan.
   else (embedded in a larger pattern, or nested inside another extglob
   group) is a clear compile error rather than a silent wrong parse; the
   general embedded case is future work.
+- `GlobBuilder::pathname`: `?`, `*`, and bracket expressions never match
+  `/` — only a literal `/` in the pattern matches one in the input, the
+  way real pathname expansion works (`*.txt` doesn't match
+  `dir/notes.txt`, but `dir/*.txt` does). Applies uniformly through the
+  whole pattern, including inside `!(p)` negation and extglob groups.
+- `GlobBuilder::period`: a `.` at the very start of the matched string
+  only matches an explicit literal `.` in the pattern — `*`/`?`/brackets
+  never match a leading dot, matching bash's default "hidden files
+  aren't globbed" behavior. Restricted v1: the pattern's opening
+  construct has to be a plain char, `?`, or bracket expression; a
+  pattern *starting* with `*` or an extglob group is a compile error
+  rather than a silent under-restriction (write an explicit leading
+  `.*` if dotfiles should match too).
 
-Pathname mode, leading-period rules, case-insensitivity, and
-prefix/suffix matching (`${var#pat}` and friends) land in follow-up
-rounds — see #20.
+Case-insensitivity and prefix/suffix matching (`${var#pat}` and friends)
+land in follow-up rounds — see #20.
 
 ---
 

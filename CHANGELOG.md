@@ -16,11 +16,21 @@ All notable changes to this crate are documented here. The format follows
   nested, sharing the same group-nesting depth cap as ERE `(...)`.
 - `Glob` `!(p)` negation, restricted-v1: only supported as the entire
   pattern (`ErrorKind::EmbeddedGlobNegation` if embedded elsewhere).
+- `GlobBuilder::pathname`/`GlobBuilder::period`: `FNM_PATHNAME`-style
+  `/`-exclusion and `FNM_PERIOD`-style leading-dot exclusion. A positive
+  bracket expression that can only lose a required-excluded character via
+  a POSIX class (`[[:punct:]]`/`[[:print:]]`/`[[:graph:]]`) is
+  `ErrorKind::GlobClassExclusionUnsupported`; `period` mode on a pattern
+  starting with `*` or an extglob group is
+  `ErrorKind::GlobLeadingPeriodUnsupported`.
 
 ### Internal
 
 - `parser::MAX_NESTING_DEPTH`/`check_depth` are now `pub(crate)`, shared
   with the glob translator's extglob-group nesting check.
+- `compile::posix_matches` is now `pub(crate)`, used by the glob
+  translator to decide at parse time whether a bracket's POSIX classes
+  already exclude a character `pathname`/`period` mode must exclude.
 - Bracket-expression parsing (`[...]`, POSIX classes, collating/
   equivalence forms) factored out of `parser::Parser` into a shared
   `bracket` module, used by both the ERE parser and the new glob
