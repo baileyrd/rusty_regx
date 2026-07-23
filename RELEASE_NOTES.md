@@ -29,9 +29,16 @@ engine as ERE matching — see `docs/GLOB_DESIGN.md` for the full plan.
   (`@(a|@(b|c))`) and compose with everything else (`file.@(txt|md)`).
   Same nesting-depth cap as ERE groups, and the same guarantee: no
   backtracking, however the alternatives are arranged.
+- `!(p)` negation — restricted to the *whole* pattern for now (e.g.
+  `"!(foo|bar)"`), per the design doc's v1 plan. Since glob matching is
+  always full-string, a whole-pattern negation is just "does `p` match?
+  flip the answer" — no new matching machinery needed. `!(p)` anywhere
+  else (embedded in a larger pattern, or nested inside another extglob
+  group) is a clear compile error rather than a silent wrong parse; the
+  general embedded case is future work.
 
-`!()` negation, pathname mode, leading-period rules, case-insensitivity,
-and prefix/suffix matching (`${var#pat}` and friends) land in follow-up
+Pathname mode, leading-period rules, case-insensitivity, and
+prefix/suffix matching (`${var#pat}` and friends) land in follow-up
 rounds — see #20.
 
 ---
