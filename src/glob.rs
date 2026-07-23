@@ -224,6 +224,76 @@ impl Glob {
             crate::SCRATCH.with(|s| crate::vm::exec_bool(program, name, 0, &mut s.borrow_mut()));
         matched != negate
     }
+
+    /// Finds a prefix of `s` (starting at byte `0`) that fully matches
+    /// this pattern, returning its length in bytes — the shell's
+    /// `${var#pat}`/`${var##pat}` family: `longest = false` is `#`
+    /// (shortest matching prefix removed), `longest = true` is `##`
+    /// (longest). `None` if no prefix — including the empty one —
+    /// matches.
+    ///
+    /// Checks candidate prefix lengths at `char` boundaries, scanning
+    /// from the shortest or longest end first and stopping at the first
+    /// hit — correct for any pattern, including `*`/extglob-heavy ones,
+    /// by construction (each candidate is just [`Glob::matches`] against
+    /// a substring), though it's `O(n)` `matches` calls rather than the
+    /// single linear pass the crate's ERE matching guarantees.
+    ///
+    /// ```
+    /// use rusty_regx::Glob;
+    ///
+    /// let g = Glob::new("a*")?;
+    /// assert_eq!(g.match_prefix("azbz", false), Some(1)); // shortest: "a"
+    /// assert_eq!(g.match_prefix("azbz", true), Some(4)); // longest: "azbz"
+    /// assert_eq!(Glob::new("q*")?.match_prefix("azbz", false), None); // doesn't start with 'q' at all
+    /// # Ok::<(), rusty_regx::Error>(())
+    /// ```
+    pub fn match_prefix(&self, s: &str, longest: bool) -> Option<usize> {
+        let mut boundaries = prefix_boundaries(s);
+        if longest {
+            boundaries.rev().find(|&k| self.matches(&s[..k]))
+        } else {
+            boundaries.find(|&k| self.matches(&s[..k]))
+        }
+    }
+
+    /// Finds a suffix of `s` (ending at `s.len()`) that fully matches
+    /// this pattern, returning the suffix's *starting* byte offset — the
+    /// shell's `${var%pat}`/`${var%%pat}` family: `longest = false` is
+    /// `%` (shortest matching suffix removed, i.e. the largest starting
+    /// offset), `longest = true` is `%%` (longest, smallest offset).
+    /// `None` if no suffix — including the empty one — matches.
+    ///
+    /// Same approach and complexity as [`Glob::match_prefix`], scanning
+    /// from the shortest or longest end first.
+    ///
+    /// ```
+    /// use rusty_regx::Glob;
+    ///
+    /// let g = Glob::new("*z")?;
+    /// assert_eq!(g.match_suffix("azbz", false), Some(3)); // shortest: "z"
+    /// assert_eq!(g.match_suffix("azbz", true), Some(0)); // longest: "azbz"
+    /// assert_eq!(Glob::new("*q")?.match_suffix("azbz", false), None); // doesn't end in 'q' at all
+    /// # Ok::<(), rusty_regx::Error>(())
+    /// ```
+    pub fn match_suffix(&self, s: &str, longest: bool) -> Option<usize> {
+        let mut boundaries = prefix_boundaries(s);
+        if longest {
+            boundaries.find(|&k| self.matches(&s[k..]))
+        } else {
+            boundaries.rev().find(|&k| self.matches(&s[k..]))
+        }
+    }
+}
+
+/// Every byte offset a prefix or suffix split could land on: each `char`
+/// boundary plus `s.len()`, ascending. Shared by [`Glob::match_prefix`]
+/// and [`Glob::match_suffix`] — a prefix's *end* offset and a suffix's
+/// *start* offset range over the exact same set of positions.
+fn prefix_boundaries(s: &str) -> impl DoubleEndedIterator<Item = usize> + '_ {
+    s.char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(s.len()))
 }
 
 /// Parses a glob pattern into the shared ERE [`Ast`] (unanchored — the
@@ -998,6 +1068,76 @@ mod tests {
         assert!(g.matches("readme"));
         assert!(!g.matches("dir/readme")); // pathname: `*` doesn't cross `/`
         assert!(!g.matches(".readme")); // period: leading dot still excluded
+    }
+
+    #[test]
+    fn match_prefix_shortest_and_longest() {
+        let g = Glob::new("a*").unwrap();
+        assert_eq!(g.match_prefix("aaab", false), Some(1));
+        assert_eq!(g.match_prefix("aaab", true), Some(4));
+        assert_eq!(Glob::new("z*").unwrap().match_prefix("aaab", false), None);
+        assert_eq!(Glob::new("z*").unwrap().match_prefix("aaab", true), None);
+    }
+
+    #[test]
+    fn match_suffix_shortest_and_longest() {
+        let g = Glob::new("*b").unwrap();
+        assert_eq!(g.match_suffix("aaab", false), Some(3));
+        assert_eq!(g.match_suffix("aaab", true), Some(0));
+        assert_eq!(Glob::new("*z").unwrap().match_suffix("aaab", false), None);
+        assert_eq!(Glob::new("*z").unwrap().match_suffix("aaab", true), None);
+    }
+
+    #[test]
+    fn match_prefix_suffix_empty_pattern_only_matches_empty() {
+        let g = Glob::new("").unwrap();
+        assert_eq!(g.match_prefix("abc", false), Some(0));
+        assert_eq!(g.match_prefix("abc", true), Some(0));
+        assert_eq!(g.match_suffix("abc", false), Some(3));
+        assert_eq!(g.match_suffix("abc", true), Some(3));
+    }
+
+    #[test]
+    fn match_prefix_suffix_bare_star_matches_empty_or_everything() {
+        let g = Glob::new("*").unwrap();
+        assert_eq!(g.match_prefix("abc", false), Some(0));
+        assert_eq!(g.match_prefix("abc", true), Some(3));
+        assert_eq!(g.match_suffix("abc", false), Some(3));
+        assert_eq!(g.match_suffix("abc", true), Some(0));
+    }
+
+    #[test]
+    fn match_prefix_with_extglob() {
+        let g = Glob::new("@(foo|bar)*").unwrap();
+        assert_eq!(g.match_prefix("foobar", false), Some(3));
+        assert_eq!(g.match_prefix("foobar", true), Some(6));
+    }
+
+    #[test]
+    fn match_prefix_composes_with_negation() {
+        // "!(a)" matches anything except exactly "a" — the empty string
+        // qualifies, so the shortest matching prefix is always length 0.
+        let g = Glob::new("!(a)").unwrap();
+        assert_eq!(g.match_prefix("ab", false), Some(0));
+    }
+
+    #[test]
+    fn match_prefix_composes_with_pathname() {
+        // Under pathname mode, `a*`'s `*` can't cross `/`, so the longest
+        // matching prefix of "a/b" is the same as the shortest: just "a".
+        let g = GlobBuilder::new().pathname(true).build("a*").unwrap();
+        assert_eq!(g.match_prefix("a/b", false), Some(1));
+        assert_eq!(g.match_prefix("a/b", true), Some(1));
+    }
+
+    #[test]
+    fn match_prefix_suffix_respect_char_boundaries() {
+        // "é" is 2 UTF-8 bytes; candidate lengths must land on char
+        // boundaries, not split it.
+        let g = Glob::new("?").unwrap();
+        assert_eq!(g.match_prefix("héllo", false), Some(1)); // "h"
+        let g2 = Glob::new("??").unwrap();
+        assert_eq!(g2.match_prefix("héllo", false), Some(3)); // "h" + "é" (2 bytes)
     }
 
     #[test]

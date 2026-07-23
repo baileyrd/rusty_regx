@@ -54,9 +54,16 @@ engine as ERE matching — see `docs/GLOB_DESIGN.md` for the full plan.
   lowercasing — gets the `[A-_]`-style corners right). Composes with
   everything else in this module for free, since it's the same compiler
   stage `Regex` already uses.
+- `Glob::match_prefix`/`Glob::match_suffix`: the machinery behind bash's
+  `${var#pat}`/`${var##pat}`/`${var%pat}`/`${var%%pat}` family — finds
+  the shortest or longest prefix/suffix of a string that fully matches
+  the pattern, returning its length/offset. Composes with everything
+  above: `pathname`, `period`, `case_insensitive`, extglob, and `!(p)`
+  negation all just work, since each candidate reuses `Glob::matches`
+  directly.
 
-Prefix/suffix matching (`${var#pat}` and friends) lands in a follow-up
-round — see #20.
+With this, `Glob`'s API sketch from `docs/GLOB_DESIGN.md` is complete —
+what's left under #20 is the differential harness against bash.
 
 ---
 

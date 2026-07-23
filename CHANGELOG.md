@@ -26,6 +26,10 @@ All notable changes to this crate are documented here. The format follows
 - `GlobBuilder::case_insensitive`: `REG_ICASE` folding, identical to
   `Regex::new_ci`/`Regex::new_posix_ci`'s, applied by the same compiler
   stage so it composes with every other `Glob` feature.
+- `Glob::match_prefix`/`Glob::match_suffix`: shortest/longest matching
+  prefix or suffix length, for `${var#pat}`/`${var##pat}`/`${var%pat}`/
+  `${var%%pat}`. Scans `char`-boundary candidate lengths from the
+  shortest or longest end, reusing `Glob::matches` per candidate.
 
 ### Internal
 
