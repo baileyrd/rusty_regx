@@ -6,6 +6,31 @@ anything mentioned here, see the [cookbook](docs/COOKBOOK.md).
 
 ---
 
+## Unreleased
+
+**Shell glob matching, part 1 of #20.** The first piece of `fnmatch`-style
+glob support (`?`, `*`, `[...]`, `[!...]`), built on the same linear-time
+engine as ERE matching — see `docs/GLOB_DESIGN.md` for the full plan.
+
+### ✨ New
+
+- `Glob`/`GlobBuilder`: compile a shell glob pattern and test it against a
+  whole string with `Glob::matches`. Unlike `Regex`, matching is always a
+  full match, never a substring search — glob patterns describe an entire
+  name. Translates directly onto the existing AST, so it gets the same
+  execution tiers (and the same no-backtracking guarantee) as ERE
+  patterns for free.
+- Bracket expressions (`[abc]`, `[a-z]`, `[[:digit:]]`, collating/
+  equivalence forms) work exactly as in `Regex`, plus glob's `!` as an
+  alternative negation marker alongside POSIX `^` (`[!abc]` and `[^abc]`
+  are equivalent).
+
+Extglob operators (`@()` `?()` `*()` `+()` `!()`), pathname mode,
+leading-period rules, case-insensitivity, and prefix/suffix matching
+(`${var#pat}` and friends) land in follow-up rounds — see #20.
+
+---
+
 ## 0.5.0 — July 18, 2026
 
 **Hardening and a POSIX-mode performance gap closed.** No API changes —
