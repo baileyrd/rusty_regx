@@ -45,12 +45,15 @@
 #![warn(missing_docs)]
 
 mod ast;
+mod bracket;
 mod compile;
 mod error;
+mod glob;
 mod parser;
 mod vm;
 
 pub use error::{Error, ErrorKind};
+pub use glob::{Glob, GlobBuilder};
 
 std::thread_local! {
     /// Reused by every one-shot call (`is_match`/`captures`/`find`) on

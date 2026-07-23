@@ -6,6 +6,20 @@ All notable changes to this crate are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `Glob`/`GlobBuilder`: shell glob (`fnmatch`-style) pattern matching —
+  `?`, `*`, `[...]`/`[!...]`, literals — compiled onto the existing ERE
+  `Ast`, full-string matching via `Glob::matches`. First slice of #20; see
+  `docs/GLOB_DESIGN.md`.
+
+### Internal
+
+- Bracket-expression parsing (`[...]`, POSIX classes, collating/
+  equivalence forms) factored out of `parser::Parser` into a shared
+  `bracket` module, used by both the ERE parser and the new glob
+  translator so the grammar lives in exactly one place.
+
 ## [0.5.0] — 2026-07-18
 
 ### Added

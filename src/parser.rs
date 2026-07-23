@@ -42,6 +42,7 @@
 //!   overflow.
 
 use crate::ast::{Ast, Class, PosixClass};
+use crate::bracket;
 use crate::compile::MAX_REPETITION_SIZE;
 use crate::error::{Error, ErrorKind};
 
@@ -139,10 +140,6 @@ impl Parser<'_> {
 
     fn peek(&self) -> Option<char> {
         self.rest().chars().next()
-    }
-
-    fn peek_at(&self, offset: usize) -> Option<char> {
-        self.rest().chars().nth(offset)
     }
 
     fn bump(&mut self) -> Option<char> {
@@ -357,128 +354,15 @@ impl Parser<'_> {
     }
 
     /// Parses a bracket expression; the leading `[` has been consumed.
+    /// Delegates to the shared bracket-expression grammar (also used by
+    /// the glob translator) — see `bracket::parse`.
     fn bracket(&mut self) -> Result<Ast, Error> {
         let open = self.char_pos - 1;
-        let negated = self.eat('^');
-        let mut class = Class {
-            negated,
-            ranges: Vec::new(),
-            posix: Vec::new(),
-        };
-        let mut first = true;
-        loop {
-            match self.peek() {
-                None => return Err(Error::new(ErrorKind::UnclosedBracket, Some(open))),
-                Some(']') if !first => {
-                    self.bump();
-                    break;
-                }
-                _ => {}
-            }
-            first = false;
-            self.bracket_item(&mut class)?;
-        }
+        let mut cursor = bracket::Cursor::new(self.pattern, self.byte_pos, self.char_pos);
+        let class = bracket::parse(&mut cursor, open, &['^'])?;
+        self.byte_pos = cursor.byte_pos;
+        self.char_pos = cursor.char_pos;
         Ok(Ast::Class(class))
-    }
-
-    /// One bracket item: a POSIX class, a range `a-z`, or a literal char.
-    fn bracket_item(&mut self, class: &mut Class) -> Result<(), Error> {
-        let start = self.char_pos;
-        let mut lo_is_equiv = false;
-        let lo = if self.peek() == Some('[') {
-            match self.peek_at(1) {
-                Some(':') => {
-                    class.posix.push(self.posix_class()?);
-                    return Ok(());
-                }
-                // The degenerate (single-char) forms of collating symbols
-                // and equivalence classes — what bash accepts in C/UTF-8
-                // locales; multi-char collating names stay errors.
-                Some('.') => self.collating(start, '.')?,
-                Some('=') => {
-                    lo_is_equiv = true;
-                    self.collating(start, '=')?
-                }
-                _ => self.bump().expect("checked non-empty"),
-            }
-        } else {
-            self.bump().expect("checked non-empty")
-        };
-        // `a-z` is a range unless the `-` is last (`[a-]`, trailing `-` is
-        // literal) or the expression is unclosed.
-        if self.peek() == Some('-') && self.peek_at(1).is_some_and(|c| c != ']') {
-            // glibc: an equivalence class can't be a range endpoint
-            // (`[[=a=]-c]` is a compile error), but a collating symbol can.
-            if lo_is_equiv {
-                return Err(Error::new(ErrorKind::InvalidRange, Some(start)));
-            }
-            self.bump();
-            let hi = if self.peek() == Some('[') && self.peek_at(1) == Some('.') {
-                self.collating(start, '.')?
-            } else {
-                let hi = self.bump().expect("checked non-empty");
-                // A class or equivalence can't be a range endpoint:
-                // `[a-[:digit:]]`, `[a-[=c=]]`.
-                if hi == '[' && matches!(self.peek(), Some(':') | Some('=')) {
-                    return Err(Error::new(ErrorKind::InvalidRange, Some(start)));
-                }
-                hi
-            };
-            if lo > hi {
-                return Err(Error::new(ErrorKind::InvalidRange, Some(start)));
-            }
-            class.ranges.push((lo, hi));
-        } else {
-            class.ranges.push((lo, lo));
-        }
-        Ok(())
-    }
-
-    /// Parses the degenerate form of `[.c.]` (`delim == '.'`) or `[=c=]`
-    /// (`delim == '='`): exactly one char between the delimiters. In the
-    /// C/UTF-8 locales bash runs in, that char is the whole collating
-    /// symbol / equivalence class; multi-char collating names are errors
-    /// in glibc too ("no such collating element").
-    fn collating(&mut self, at: usize, delim: char) -> Result<char, Error> {
-        let err = || Error::new(ErrorKind::InvalidPosixClass, Some(at));
-        self.bump(); // `[`
-        self.bump(); // delim
-        let c = self.bump().ok_or_else(err)?;
-        if !(self.eat(delim) && self.eat(']')) {
-            return Err(err());
-        }
-        Ok(c)
-    }
-
-    /// Parses `[:name:]`; the leading `[` has been peeked (not consumed).
-    fn posix_class(&mut self) -> Result<PosixClass, Error> {
-        let open = self.char_pos;
-        let err = || Error::new(ErrorKind::InvalidPosixClass, Some(open));
-        self.bump(); // `[`
-        self.bump(); // `:`
-        let start = self.byte_pos;
-        while self.peek().is_some_and(|c| c.is_ascii_lowercase()) {
-            self.bump();
-        }
-        let name = &self.pattern[start..self.byte_pos];
-        if !(self.eat(':') && self.eat(']')) {
-            return Err(err());
-        }
-        match name {
-            "alnum" => Ok(PosixClass::Alnum),
-            "alpha" => Ok(PosixClass::Alpha),
-            "blank" => Ok(PosixClass::Blank),
-            "cntrl" => Ok(PosixClass::Cntrl),
-            "digit" => Ok(PosixClass::Digit),
-            "graph" => Ok(PosixClass::Graph),
-            "lower" => Ok(PosixClass::Lower),
-            "print" => Ok(PosixClass::Print),
-            "punct" => Ok(PosixClass::Punct),
-            "space" => Ok(PosixClass::Space),
-            "upper" => Ok(PosixClass::Upper),
-            "xdigit" => Ok(PosixClass::Xdigit),
-            _ => Err(err()),
-        }
     }
 }
 
