@@ -23,6 +23,9 @@ All notable changes to this crate are documented here. The format follows
   `ErrorKind::GlobClassExclusionUnsupported`; `period` mode on a pattern
   starting with `*` or an extglob group is
   `ErrorKind::GlobLeadingPeriodUnsupported`.
+- `GlobBuilder::case_insensitive`: `REG_ICASE` folding, identical to
+  `Regex::new_ci`/`Regex::new_posix_ci`'s, applied by the same compiler
+  stage so it composes with every other `Glob` feature.
 
 ### Internal
 
