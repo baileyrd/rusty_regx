@@ -31,6 +31,13 @@ All notable changes to this crate are documented here. The format follows
   `${var%%pat}`. Scans `char`-boundary candidate lengths from the
   shortest or longest end, reusing `Glob::matches` per candidate.
 
+### Tests
+
+- `tests/glob_differential.rs`: a differential harness cross-checking
+  `Glob` against bash's `[[ == ]]` and `case` (both `shopt -s extglob`),
+  plus an adversarial extglob linear-time check. Part of #20's migration
+  plan.
+
 ### Internal
 
 - `parser::MAX_NESTING_DEPTH`/`check_depth` are now `pub(crate)`, shared
