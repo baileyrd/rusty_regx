@@ -12,9 +12,13 @@ All notable changes to this crate are documented here. The format follows
   `?`, `*`, `[...]`/`[!...]`, literals — compiled onto the existing ERE
   `Ast`, full-string matching via `Glob::matches`. First slice of #20; see
   `docs/GLOB_DESIGN.md`.
+- `Glob` extglob operators `@(a|b)`, `*(p)`, `+(p)`, `?(p)`, arbitrarily
+  nested, sharing the same group-nesting depth cap as ERE `(...)`.
 
 ### Internal
 
+- `parser::MAX_NESTING_DEPTH`/`check_depth` are now `pub(crate)`, shared
+  with the glob translator's extglob-group nesting check.
 - Bracket-expression parsing (`[...]`, POSIX classes, collating/
   equivalence forms) factored out of `parser::Parser` into a shared
   `bracket` module, used by both the ERE parser and the new glob
