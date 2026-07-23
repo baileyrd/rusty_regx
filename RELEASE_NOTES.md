@@ -49,9 +49,14 @@ engine as ERE matching — see `docs/GLOB_DESIGN.md` for the full plan.
   pattern *starting* with `*` or an extglob group is a compile error
   rather than a silent under-restriction (write an explicit leading
   `.*` if dotfiles should match too).
+- `GlobBuilder::case_insensitive`: the same `REG_ICASE` fold
+  `Regex::new_ci`/`Regex::new_posix_ci` use (fold-to-uppercase, not naive
+  lowercasing — gets the `[A-_]`-style corners right). Composes with
+  everything else in this module for free, since it's the same compiler
+  stage `Regex` already uses.
 
-Case-insensitivity and prefix/suffix matching (`${var#pat}` and friends)
-land in follow-up rounds — see #20.
+Prefix/suffix matching (`${var#pat}` and friends) lands in a follow-up
+round — see #20.
 
 ---
 

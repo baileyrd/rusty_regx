@@ -8,9 +8,9 @@
 //!
 //! Covered so far: `?`, `*`, `[...]`/`[!...]`, literals, whole-pattern
 //! (full-string) matching, the bash extglob operators `@()` `?()` `*()`
-//! `+()`, `!()` negation restricted to the whole pattern, and `pathname`/
-//! `period` matching modes (see [`GlobBuilder`]). Case-insensitivity and
-//! prefix/suffix matching are follow-up issues tracked under #20.
+//! `+()`, `!()` negation restricted to the whole pattern, `pathname`/
+//! `period` matching modes, and case-insensitivity (see [`GlobBuilder`]).
+//! Prefix/suffix matching is a follow-up issue tracked under #20.
 
 use crate::ast::{Ast, Class};
 use crate::bracket;
@@ -20,13 +20,11 @@ use crate::parser;
 use std::sync::Arc;
 
 /// Builds a [`Glob`] with non-default options.
-///
-/// Currently exposes [`GlobBuilder::pathname`] and [`GlobBuilder::period`];
-/// later issues under #20 add a `case_insensitive` method here too.
 #[derive(Debug, Clone, Default)]
 pub struct GlobBuilder {
     pathname: bool,
     period: bool,
+    case_insensitive: bool,
 }
 
 impl GlobBuilder {
@@ -82,6 +80,21 @@ impl GlobBuilder {
         self
     }
 
+    /// Case-insensitive matching — `REG_ICASE` semantics, identical to
+    /// [`crate::Regex::new_ci`]/[`crate::Regex::new_posix_ci`]'s: pattern
+    /// literals, bracket-expression range endpoints, and the input all
+    /// fold to uppercase (glibc's model, not simple lowercasing — see
+    /// [`crate::Regex::new_posix_ci`]'s doc comment for the corner cases
+    /// this gets right that naive lowercasing doesn't). Folding is
+    /// applied by the same compiler stage `Regex` uses, so it composes
+    /// with everything else in this module — `pathname`/`period`'s `/`/`.`
+    /// exclusions, extglob groups, and `!(p)` negation — for free.
+    #[must_use]
+    pub fn case_insensitive(mut self, yes: bool) -> GlobBuilder {
+        self.case_insensitive = yes;
+        self
+    }
+
     /// Compiles `pattern` as a shell glob.
     ///
     /// Returns a structured [`Error`] describing the first problem found
@@ -123,7 +136,7 @@ impl GlobBuilder {
             // `period` doesn't (yet) compose with whole-pattern `!(p)` —
             // see `GlobBuilder::period`'s doc comment.
             let wrapped = Ast::Concat(vec![Ast::StartAnchor, inner, Ast::EndAnchor]);
-            let program = Arc::new(compile::compile(wrapped, false, false)?);
+            let program = Arc::new(compile::compile(wrapped, self.case_insensitive, false)?);
             return Ok(Glob {
                 compiled: Compiled::Negated(program),
             });
@@ -137,7 +150,7 @@ impl GlobBuilder {
         // existing anchored-match compilation path, with no separate
         // "full match" mode needed in the VM.
         let wrapped = Ast::Concat(vec![Ast::StartAnchor, ast, Ast::EndAnchor]);
-        let program = Arc::new(compile::compile(wrapped, false, false)?);
+        let program = Arc::new(compile::compile(wrapped, self.case_insensitive, false)?);
         Ok(Glob {
             compiled: Compiled::Positive(program),
         })
@@ -930,6 +943,61 @@ mod tests {
             .build("!(a*)")
             .unwrap()
             .matches("a/b"));
+    }
+
+    fn ci_matches(pattern: &str, name: &str) -> bool {
+        GlobBuilder::new()
+            .case_insensitive(true)
+            .build(pattern)
+            .unwrap()
+            .matches(name)
+    }
+
+    #[test]
+    fn case_insensitive_literals() {
+        assert!(ci_matches("readme.md", "README.MD"));
+        assert!(ci_matches("ReadMe.Md", "readme.md"));
+        assert!(!matches("readme.md", "README.MD"));
+    }
+
+    #[test]
+    fn case_insensitive_bracket_ranges_fold() {
+        // Same `[A-_]`-style corner `Regex::new_posix_ci` documents: `_`
+        // (0x5F) sits right after `Z` (0x5A) and folds specially under
+        // glibc's fold-to-upper model.
+        assert!(ci_matches("[a-f]", "C"));
+        assert!(ci_matches("[a-f]", "c"));
+        assert!(!ci_matches("[a-f]", "g"));
+    }
+
+    #[test]
+    fn case_insensitive_composes_with_extglob_and_negation() {
+        assert!(ci_matches("@(FOO|bar)", "foo"));
+        assert!(ci_matches("@(FOO|bar)", "BAR"));
+        assert!(GlobBuilder::new()
+            .case_insensitive(true)
+            .build("!(FOO)")
+            .unwrap()
+            .matches("bar"));
+        assert!(!GlobBuilder::new()
+            .case_insensitive(true)
+            .build("!(FOO)")
+            .unwrap()
+            .matches("foo"));
+    }
+
+    #[test]
+    fn case_insensitive_composes_with_pathname_and_period() {
+        let g = GlobBuilder::new()
+            .case_insensitive(true)
+            .pathname(true)
+            .period(true)
+            .build("[Rr]*")
+            .unwrap();
+        assert!(g.matches("Readme"));
+        assert!(g.matches("readme"));
+        assert!(!g.matches("dir/readme")); // pathname: `*` doesn't cross `/`
+        assert!(!g.matches(".readme")); // period: leading dot still excluded
     }
 
     #[test]
